@@ -1,0 +1,37 @@
+# =========================
+# Build Artifacts (CMake)
+# =========================
+/build/
+/cmake-build-*/
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/compile_commands.json
+
+# =========================
+# Binaries
+# =========================
+/bin/
+/*.exe
+/*.out
+
+# =========================
+# SQLite / Runtime Data
+# =========================
+/compliance.db
+/*.db
+/*.db-journal
+/*.db-wal
+/*.db-shm
+
+
+
+# =========================
+# C++ Object Files
+# =========================
+*.o
+*.a
+*.so
+*.dll
+*.dylib
