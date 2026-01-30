@@ -17,6 +17,7 @@ size_t NetworkConnector::writeCallback(void* contents, size_t size, size_t nmemb
 }
 
 bool NetworkConnector::fetch(const std::string& url, std::string& response) {
+    response.clear();
     CURL* curl = curl_easy_init();
     if (!curl) return false;
 

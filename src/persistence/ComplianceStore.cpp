@@ -26,6 +26,11 @@ bool ComplianceStore::init() {
         std::cerr << "[DB ERROR] Failed to open database\n";
         return false;
     }
+    if (!execSimple(db, "PRAGMA foreign_keys = ON;", "Enable foreign keys")) {
+        sqlite3_close(db);
+        db = nullptr;
+        return false;
+    }
 
     const char* schema = R"SQL(
         CREATE TABLE IF NOT EXISTS recon_runs (
@@ -99,10 +104,13 @@ bool ComplianceStore::startRun(const std::string& runId,
         return false;
     }
 
-    sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, target.c_str(), -1, SQLITE_TRANSIENT);
-
+    if (sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 3, target.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        std::cerr << "[DB ERROR] bind startRun: " << sqlite3_errmsg(db) << "\n";
+        sqlite3_finalize(stmt);
+        return false;
+    }
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
@@ -123,9 +131,12 @@ bool ComplianceStore::completeRun(const std::string& runId,
         return false;
     }
 
-    sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, runId.c_str(), -1, SQLITE_TRANSIENT);
-
+    if (sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        std::cerr << "[DB ERROR] bind completeRun: " << sqlite3_errmsg(db) << "\n";
+        sqlite3_finalize(stmt);
+        return false;
+    }
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
@@ -161,12 +172,15 @@ bool ComplianceStore::logViolation(const ViolationRecord& record,
         return false;
     }
 
-    sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, record.userID.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, record.type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, record.severity.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, hash.c_str(), -1, SQLITE_TRANSIENT);
-
+    if (sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, record.userID.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 3, record.type.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 4, record.severity.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 5, hash.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        std::cerr << "[DB ERROR] bind logViolation: " << sqlite3_errmsg(db) << "\n";
+        sqlite3_finalize(stmt);
+        return false;
+    }
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {

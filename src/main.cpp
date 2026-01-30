@@ -61,7 +61,10 @@ int main() {
 
     // === 5. Reconcile ===
     Reconciler reconciler(store);
-    reconciler.runReconciliation(hrIdentities, systemIdentities);
+    if (!reconciler.runReconciliation(hrIdentities, systemIdentities)) {
+        std::cerr << "[ERROR] Reconciliation failed.\n";
+        return 1;
+    }
 
     std::cout << "[IDSentinel] Reconciliation complete.\n";
     return 0;

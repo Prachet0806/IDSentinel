@@ -9,7 +9,8 @@ class Reconciler {
 public:
     explicit Reconciler(ComplianceStore& store);
 
-    void runReconciliation(
+    /** Returns true if reconciliation completed successfully, false on failure. */
+    bool runReconciliation(
         const std::unordered_map<std::string, Identity>& hrSource,
         const std::unordered_map<std::string, Identity>& targetSystem
     );
