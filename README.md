@@ -138,7 +138,7 @@ build/bin/IDSentinel
 
 ---
 
-## 💾 Database Schema (The Governance Ledger)
+## Database Schema (The Governance Ledger)
 
 ### `recon_runs`
 
@@ -197,7 +197,7 @@ Defined in `Reconciler`:
 
 ---
 
-## 🔍 Inspecting Results
+## Inspecting Results
 
 Open the database:
 
