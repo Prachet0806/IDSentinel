@@ -1,0 +1,22 @@
+{
+  "name": "idsentinel",
+  "version": "1.0.0",
+  "description": "Identity Reconciliation Engine",
+  "dependencies": [
+    "curl",
+    "sqlite3",
+    "openssl",
+    "spdlog",
+    "cli11",
+    "toml++",
+    "catch2",
+    "nlohmann-json",
+    "fmt"
+  ],
+  "builtin-baseline": "rolling",
+  "features": {
+    "testing": [
+      "catch2"
+    ]
+  }
+}

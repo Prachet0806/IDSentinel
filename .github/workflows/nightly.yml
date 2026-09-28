@@ -1,0 +1,66 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  strict-analysis:
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_BINARY_SOURCES: "clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
+          vcpkgGitCommitId: 'rolling'
+          vcpkgArguments: 'install --feature-flags=manifests'
+          appendedCacheArgs: '--binarysource=clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite'
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run clang-tidy (strict)
+        run: |
+          pip install clang-tidy-review
+          run-clang-tidy-18 -p build -checks='bugprone-*,performance-*,modernize-*,readability-*,clang-analyzer-*,cppcoreguidelines-*' -header-filter='.*' -quiet || true
+
+      - name: Run cppcheck (strict)
+        run: |
+          cppcheck --enable=all --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/ || true
+
+      - name: Run tests with coverage
+        run: |
+          cmake -S . -B build_coverage -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="--coverage"
+          cmake --build build_coverage --config Debug --parallel
+          ctest --test-dir build_coverage --output-on-failure
+          gcovr --root . --filter 'src/.*' --exclude 'tests/.*' --print-summary
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
+          vcpkgGitCommitId: 'rolling'
+          vcpkgArguments: 'install --feature-flags=manifests'
+
+      - name: Check for outdated packages
+        run: |
+          cd ${{ runner.temp }}/vcpkg
+          ./vcpkg outdated

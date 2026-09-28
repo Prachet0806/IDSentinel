@@ -1,0 +1,15 @@
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-use-nullptr,
+  modernize-use-emplace,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-use-override,
+  readability-identifier-naming,
+  readability-magic-numbers,
+  readability-function-cognitive-complexity,
+  readability-container-size-empty
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+AnalyzeTemporaryDtors: false

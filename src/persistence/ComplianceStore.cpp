@@ -1,36 +1,60 @@
 #include "ComplianceStore.h"
-#include <iostream>
+#include <spdlog/spdlog.h>
+#include <sqlite3.h>
+#include <array>
 
-namespace {
-bool execSimple(sqlite3* db, const std::string& sql, const std::string& ctx) {
-    char* errMsg = nullptr;
-    int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
-    if (rc != SQLITE_OK) {
-        std::cerr << "[DB ERROR] " << ctx << ": " << (errMsg ? errMsg : "unknown") << "\n";
-        sqlite3_free(errMsg);
-        return false;
-    }
-    return true;
-}
-}
-
-ComplianceStore::ComplianceStore(const std::string& path)
-    : db(nullptr), dbPath(path) {}
+ComplianceStore::ComplianceStore(const std::filesystem::path& dbPath, bool walMode, int busyTimeoutMs)
+    : dbPath_(dbPath), walMode_(walMode), busyTimeoutMs_(busyTimeoutMs) {}
 
 ComplianceStore::~ComplianceStore() {
-    if (db) sqlite3_close(db);
+    if (bulkStmt_) sqlite3_finalize(bulkStmt_);
+    if (db_) sqlite3_close(db_);
 }
 
-bool ComplianceStore::init() {
-    if (sqlite3_open(dbPath.c_str(), &db) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] Failed to open database\n";
-        return false;
+Result<void> ComplianceStore::execSimple(const std::string& sql, const std::string& context) {
+    char* errMsg = nullptr;
+    int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errMsg);
+    if (rc != SQLITE_OK) {
+        std::string err = errMsg ? errMsg : "unknown";
+        sqlite3_free(errMsg);
+        SPDLOG_ERROR("DB {} failed: {}", context, err);
+        return Result<void>::err(Error{ "SQLITE_ERROR", context + ": " + err });
     }
-    if (!execSimple(db, "PRAGMA foreign_keys = ON;", "Enable foreign keys")) {
-        sqlite3_close(db);
-        db = nullptr;
-        return false;
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::bindText(sqlite3_stmt* stmt, int index, const std::string& value) {
+    int rc = sqlite3_bind_text(stmt, index, value.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        SPDLOG_ERROR("SQLite bind text failed at index {}: {}", index, sqlite3_errmsg(db_));
+        return Result<void>::err(Error{ "SQLITE_BIND", "bind text index " + std::to_string(index) });
     }
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::bindInt(sqlite3_stmt* stmt, int index, int value) {
+    int rc = sqlite3_bind_int(stmt, index, value);
+    if (rc != SQLITE_OK) {
+        SPDLOG_ERROR("SQLite bind int failed at index {}: {}", index, sqlite3_errmsg(db_));
+        return Result<void>::err(Error{ "SQLITE_BIND", "bind int index " + std::to_string(index) });
+    }
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::init() {
+    std::filesystem::create_directories(dbPath_.parent_path());
+
+    if (sqlite3_open(dbPath_.string().c_str(), &db_) != SQLITE_OK) {
+        std::string err = db_ ? sqlite3_errmsg(db_) : "unknown";
+        SPDLOG_ERROR("Failed to open database: {}", err);
+        return Result<void>::err(Error{ "SQLITE_OPEN", err });
+    }
+
+    if (auto r = execSimple("PRAGMA foreign_keys = ON;", "Enable foreign keys"); r.hasError()) return r;
+    if (walMode_) {
+        if (auto r = execSimple("PRAGMA journal_mode = WAL;", "Enable WAL mode"); r.hasError()) return r;
+    }
+    if (auto r = execSimple("PRAGMA busy_timeout = " + std::to_string(busyTimeoutMs_) + ";", "Set busy timeout"); r.hasError()) return r;
 
     const char* schema = R"SQL(
         CREATE TABLE IF NOT EXISTS recon_runs (
@@ -64,6 +88,10 @@ bool ComplianceStore::init() {
             PRIMARY KEY (user_id, violation_type)
         );
 
+        CREATE INDEX IF NOT EXISTS idx_findings_run ON compliance_findings(run_id);
+        CREATE INDEX IF NOT EXISTS idx_findings_user ON compliance_findings(user_id);
+        CREATE INDEX IF NOT EXISTS idx_findings_type ON compliance_findings(violation_type);
+
         CREATE TRIGGER IF NOT EXISTS trg_update_history
         AFTER INSERT ON compliance_findings
         BEGIN
@@ -89,103 +117,140 @@ bool ComplianceStore::init() {
         END;
     )SQL";
 
-    return execSimple(db, schema, "Applying schema");
+    return execSimple(schema, "Apply schema");
 }
 
-bool ComplianceStore::startRun(const std::string& runId,
-                               const std::string& source,
-                               const std::string& target) {
-    const char* sql =
-        "INSERT INTO recon_runs (run_id, source_system, target_system, status) "
-        "VALUES (?, ?, ?, 'RUNNING');";
+Result<void> ComplianceStore::startRun(const RunRecord& record) {
+    const char* sql = "INSERT INTO recon_runs (run_id, source_system, target_system, status) VALUES (?, ?, ?, 'RUNNING');";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] prepare startRun: " << sqlite3_errmsg(db) << "\n";
-        return false;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<void>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
     }
 
-    if (sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 3, target.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] bind startRun: " << sqlite3_errmsg(db) << "\n";
-        sqlite3_finalize(stmt);
-        return false;
-    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+
+    if (auto r = bindText(stmt, 1, record.runId); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 2, record.sourceSystem); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 3, record.targetSystem); r.hasError()) { cleanup(); return r; }
+
     int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    cleanup();
+
     if (rc != SQLITE_DONE) {
-        std::cerr << "[DB ERROR] execute startRun: " << sqlite3_errmsg(db) << "\n";
-        return false;
+        return Result<void>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
     }
-    return true;
+
+    inTransaction_ = false;
+    return Result<void>::ok();
 }
 
-bool ComplianceStore::completeRun(const std::string& runId,
-                                  const std::string& status) {
-    const char* sql =
-        "UPDATE recon_runs SET status=?, completed_at=CURRENT_TIMESTAMP WHERE run_id=?;";
-
+Result<void> ComplianceStore::completeRun(const std::string& runId, RunStatus status) {
+    const char* sql = "UPDATE recon_runs SET status=?, completed_at=CURRENT_TIMESTAMP WHERE run_id=?;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] prepare completeRun: " << sqlite3_errmsg(db) << "\n";
-        return false;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<void>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
     }
 
-    if (sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 2, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] bind completeRun: " << sqlite3_errmsg(db) << "\n";
-        sqlite3_finalize(stmt);
-        return false;
-    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+
+    if (auto r = bindText(stmt, 1, toString(status)); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 2, runId); r.hasError()) { cleanup(); return r; }
+
     int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    cleanup();
+
     if (rc != SQLITE_DONE) {
-        std::cerr << "[DB ERROR] execute completeRun: " << sqlite3_errmsg(db) << "\n";
-        return false;
+        return Result<void>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
     }
-    return true;
+    return Result<void>::ok();
 }
 
-bool ComplianceStore::beginTransaction() {
-    return execSimple(db, "BEGIN TRANSACTION;", "Begin transaction");
+Result<void> ComplianceStore::beginTransaction() {
+    if (inTransaction_) {
+        return Result<void>::err(Error{ "TRANSACTION", "Transaction already in progress" });
+    }
+    auto r = execSimple("BEGIN TRANSACTION;", "Begin transaction");
+    if (!r.hasError()) inTransaction_ = true;
+    return r;
 }
 
-bool ComplianceStore::commitTransaction() {
-    return execSimple(db, "COMMIT;", "Commit transaction");
+Result<void> ComplianceStore::commitTransaction() {
+    if (!inTransaction_) {
+        return Result<void>::err(Error{ "TRANSACTION", "No transaction to commit" });
+    }
+    auto r = execSimple("COMMIT;", "Commit transaction");
+    if (!r.hasError()) inTransaction_ = false;
+    return r;
 }
 
-void ComplianceStore::rollbackTransaction() {
-    execSimple(db, "ROLLBACK;", "Rollback transaction");
+Result<void> ComplianceStore::rollbackTransaction() {
+    if (!inTransaction_) {
+        SPDLOG_WARN("Rollback called but no transaction active");
+        return Result<void>::ok();
+    }
+    auto r = execSimple("ROLLBACK;", "Rollback transaction");
+    if (!r.hasError()) inTransaction_ = false;
+    return r;
 }
 
-bool ComplianceStore::logViolation(const ViolationRecord& record,
-                                   const std::string& runId,
-                                   const std::string& hash) {
-    const char* sql =
-        "INSERT INTO compliance_findings "
-        "(run_id, user_id, violation_type, severity, integrity_hash) "
-        "VALUES (?, ?, ?, ?, ?);";
-
+Result<void> ComplianceStore::logViolation(const ViolationRecord& record, const std::string& runId, const std::string& integrityHash) {
+    const char* sql = "INSERT INTO compliance_findings (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] prepare logViolation: " << sqlite3_errmsg(db) << "\n";
-        return false;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<void>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
     }
 
-    if (sqlite3_bind_text(stmt, 1, runId.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 2, record.userID.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 3, record.type.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 4, record.severity.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 5, hash.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] bind logViolation: " << sqlite3_errmsg(db) << "\n";
-        sqlite3_finalize(stmt);
-        return false;
-    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+
+    if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 2, record.userId); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 3, toString(record.type)); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 4, toString(record.severity)); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 5, integrityHash); r.hasError()) { cleanup(); return r; }
+
     int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    cleanup();
+
     if (rc != SQLITE_DONE) {
-        std::cerr << "[DB ERROR] execute logViolation: " << sqlite3_errmsg(db) << "\n";
-        return false;
+        return Result<void>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
     }
-    return true;
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::prepareBulkInsert() {
+    const char* sql = "INSERT INTO compliance_findings (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(db_, sql, -1, &bulkStmt_, nullptr) != SQLITE_OK) {
+        return Result<void>::err(Error{ "SQLITE_PREPARE_BULK", sqlite3_errmsg(db_) });
+    }
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::bulkInsertViolation(const ViolationRecord& record, const std::string& runId, const std::string& integrityHash) {
+    if (!bulkStmt_) return Result<void>::err(Error{ "BULK_INSERT", "Bulk insert not prepared" });
+
+    sqlite3_reset(bulkStmt_);
+    sqlite3_clear_bindings(bulkStmt_);
+
+    if (auto r = bindText(bulkStmt_, 1, runId); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 2, record.userId); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 3, toString(record.type)); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 4, toString(record.severity)); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 5, integrityHash); r.hasError()) return r;
+
+    int rc = sqlite3_step(bulkStmt_);
+    if (rc != SQLITE_DONE) {
+        return Result<void>::err(Error{ "SQLITE_EXEC_BULK", sqlite3_errmsg(db_) });
+    }
+    return Result<void>::ok();
+}
+
+Result<void> ComplianceStore::finalizeBulkInsert() {
+    if (bulkStmt_) {
+        sqlite3_finalize(bulkStmt_);
+        bulkStmt_ = nullptr;
+    }
+    return Result<void>::ok();
 }

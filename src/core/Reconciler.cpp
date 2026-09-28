@@ -1,19 +1,68 @@
-//src/core/Reconciler.cpp
 #include "Reconciler.h"
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include <chrono>
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <thread>
+#include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <algorithm>
 
-// SHA-256 over the violation fields for tamper evidence
-static std::string computeHash(const std::string& uid,
-                               const std::string& type,
-                               const std::string& severity) {
-    std::string data = uid + "|" + type + "|" + severity;
+Reconciler::Reconciler(IViolationStore& store, std::string_view hmacKey)
+    : store_(store) {
+    orphanSeverity_ = Severity::Critical;
+    missingSeverity_ = Severity::Medium;
+
+    if (!hmacKey.empty()) {
+        // Decode base64
+        std::string decoded;
+        decoded.resize(hmacKey.size());
+        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size());
+        if (len == 32) {
+            std::copy_n(reinterpret_cast<const uint8_t*>(decoded.data()), 32, hmacKey_.begin());
+            hasHmacKey_ = true;
+            SPDLOG_INFO("HMAC-SHA256 enabled for integrity hashes");
+        } else {
+            SPDLOG_WARN("Invalid HMAC key length (decoded: {} bytes, expected 32), falling back to SHA-256", len);
+        }
+    } else {
+        SPDLOG_WARN("No HMAC key configured, using SHA-256 without secret (not tamper-proof)");
+    }
+}
+
+std::string Reconciler::generateRunID() {
+    try {
+        std::random_device rd;
+        auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
+        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+        std::seed_seq seed{
+            rd(), rd(), rd(), rd(),
+            static_cast<unsigned>(nanos & 0xFFFFFFFFu),
+            static_cast<unsigned>(nanos >> 32),
+            static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
+        };
+
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<uint64_t> dist;
+
+        std::ostringstream oss;
+        oss << "RUN_" << std::hex << nanos << "_" << dist(rng);
+        return oss.str();
+    } catch (...) {
+        auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
+        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+        std::ostringstream oss;
+        oss << "RUN_" << std::hex << nanos << "_fallback";
+        return oss.str();
+    }
+}
+
+std::string Reconciler::sha256(std::string_view data) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), digest);
+    SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), digest);
 
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
@@ -23,98 +72,136 @@ static std::string computeHash(const std::string& uid,
     return oss.str();
 }
 
-Reconciler::Reconciler(ComplianceStore& store)
-    : db(store) {
+std::string Reconciler::hmacSha256(const uint8_t* key, size_t keyLen, std::string_view data) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    unsigned int len = 0;
 
-    riskPolicy["ORPHAN_ACCOUNT"]  = "CRITICAL";
-    riskPolicy["MISSING_ACCOUNT"] = "MEDIUM";
-}
+    HMAC(EVP_sha256(), key, static_cast<int>(keyLen),
+         reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+         digest, &len);
 
-std::string Reconciler::generateRunID() {
-    using namespace std::chrono;
-    auto now = system_clock::now().time_since_epoch();
-    auto nanos = duration_cast<nanoseconds>(now).count();
-    std::random_device rd;
-    std::seed_seq seed{ static_cast<unsigned>(nanos & 0xFFFFFFFFu),
-                        static_cast<unsigned>(nanos >> 32),
-                        rd(), rd() };
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<unsigned long long> dist;
     std::ostringstream oss;
-    oss << "RUN_" << nanos << "_" << std::hex << dist(rng);
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < len; ++i) {
+        oss << std::setw(2) << static_cast<int>(digest[i]);
+    }
     return oss.str();
 }
 
-bool Reconciler::runReconciliation(
+std::string Reconciler::computeHash(std::string_view uid, ViolationType type, Severity severity) {
+    std::string data = std::string(uid) + "|" + toString(type) + "|" + toString(severity);
+
+    if (hasHmacKey_) {
+        return hmacSha256(hmacKey_.data(), hmacKey_.size(), data);
+    }
+    return sha256(data);
+}
+
+Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation(
     const std::unordered_map<std::string, Identity>& hrSource,
-    const std::unordered_map<std::string, Identity>& targetSystem
+    const std::unordered_map<std::string, Identity>& targetSystem,
+    RunMode mode
 ) {
     if (hrSource.empty()) {
-        std::cerr << "[FATAL] HR source empty. Abort.\n";
-        return false;
+        return Result<ReconciliationResult>::err(Error{ "VALIDATION", "HR source empty" });
     }
 
-    std::string runID = generateRunID();
-    std::cout << "[INFO] Starting run " << runID << "\n";
+    ReconciliationResult result;
+    result.runId = generateRunID();
 
-    if (!db.startRun(runID, "HR_API", "TARGET_SYSTEM")) {
-        std::cerr << "[ERROR] Unable to start run in database. Abort.\n";
-        return false;
+    SPDLOG_INFO("Starting reconciliation run: {}", result.runId);
+
+    if (mode == RunMode::DryRun) {
+        SPDLOG_INFO("DRY-RUN mode: no database writes will be performed");
     }
-    if (!db.beginTransaction()) {
-        std::cerr << "[ERROR] Unable to open transaction. Abort.\n";
-        db.completeRun(runID, "FAILED");
-        return false;
+
+    auto runRecord = RunRecord{ result.runId, "HR_API", "TARGET_SYSTEM" };
+    if (mode != RunMode::DryRun) {
+        if (auto r = store_.startRun(runRecord); r.hasError()) {
+            return Result<ReconciliationResult>::err(r.error());
+        }
+        if (auto r = store_.beginTransaction(); r.hasError()) {
+            store_.completeRun(result.runId, RunStatus::Failed);
+            return Result<ReconciliationResult>::err(r.error());
+        }
+        if (auto r = store_.prepareBulkInsert(); r.hasError()) {
+            store_.rollbackTransaction();
+            store_.completeRun(result.runId, RunStatus::Failed);
+            return Result<ReconciliationResult>::err(r.error());
+        }
     }
 
     bool success = true;
 
-    // ORPHAN ACCOUNTS
+    // ORPHAN_ACCOUNT: in target but not in HR
     for (const auto& [id, sysUser] : targetSystem) {
         if (hrSource.find(id) == hrSource.end()) {
-            std::string sev = riskPolicy.at("ORPHAN_ACCOUNT");
-            std::string hash = computeHash(id, "ORPHAN_ACCOUNT", sev);
+            ++result.orphanCount;
+            std::string hash = computeHash(id, ViolationType::OrphanAccount, orphanSeverity_);
 
-            if (!db.logViolation({id, "ORPHAN_ACCOUNT", sev}, runID, hash)) {
-                success = false;
-                std::cerr << "[ERROR] Failed to persist orphan violation for user " << id << "\n";
-                break;
+            if (mode == RunMode::DryRun) {
+                SPDLOG_INFO("[DRY-RUN] Orphan Account: {} (ID: {})", sysUser.name, id);
+            } else {
+                ViolationRecord vr{ id, ViolationType::OrphanAccount, orphanSeverity_ };
+                if (auto r = store_.bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
+                    SPDLOG_ERROR("Failed to log orphan violation for {}: {}", id, r.error().message);
+                    success = false;
+                    break;
+                }
+                SPDLOG_WARN("Orphan Account Detected: {} (ID: {})", sysUser.name, id);
             }
-            std::cout << "[ALERT] Orphan: " << sysUser.name << "\n";
         }
     }
 
-    // MISSING ACCOUNTS (skip if already failed)
+    // MISSING_ACCOUNT: in HR but not in target
     if (success) {
         for (const auto& [id, hrUser] : hrSource) {
             if (targetSystem.find(id) == targetSystem.end()) {
-                std::string sev = riskPolicy.at("MISSING_ACCOUNT");
-                std::string hash = computeHash(id, "MISSING_ACCOUNT", sev);
+                ++result.missingCount;
+                std::string hash = computeHash(id, ViolationType::MissingAccount, missingSeverity_);
 
-                if (!db.logViolation({id, "MISSING_ACCOUNT", sev}, runID, hash)) {
-                    success = false;
-                    std::cerr << "[ERROR] Failed to persist missing-account violation for user " << id << "\n";
-                    break;
+                if (mode == RunMode::DryRun) {
+                    SPDLOG_INFO("[DRY-RUN] Missing Account: {} (ID: {})", hrUser.name, id);
+                } else {
+                    ViolationRecord vr{ id, ViolationType::MissingAccount, missingSeverity_ };
+                    if (auto r = store_.bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
+                        SPDLOG_ERROR("Failed to log missing violation for {}: {}", id, r.error().message);
+                        success = false;
+                        break;
+                    }
                 }
             }
         }
     }
 
+    if (mode != RunMode::DryRun) {
+        if (auto r = store_.finalizeBulkInsert(); r.hasError()) {
+            SPDLOG_ERROR("Failed to finalize bulk insert: {}", r.error().message);
+            success = false;
+        }
+    }
+
     if (!success) {
-        db.rollbackTransaction();
-        db.completeRun(runID, "FAILED");
-        std::cerr << "[ERROR] Run failed and was rolled back.\n";
-        return false;
+        if (mode != RunMode::DryRun) {
+            store_.rollbackTransaction();
+            store_.completeRun(result.runId, RunStatus::Failed);
+        }
+        result.success = false;
+        return Result<ReconciliationResult>::ok(result);
     }
 
-    if (!db.commitTransaction()) {
-        db.rollbackTransaction();
-        db.completeRun(runID, "FAILED");
-        std::cerr << "[ERROR] Commit failed. Run rolled back.\n";
-        return false;
+    if (mode != RunMode::DryRun) {
+        if (auto r = store_.commitTransaction(); r.hasError()) {
+            store_.rollbackTransaction();
+            store_.completeRun(result.runId, RunStatus::Failed);
+            return Result<ReconciliationResult>::err(r.error());
+        }
+        if (auto r = store_.completeRun(result.runId, RunStatus::Success); r.hasError()) {
+            return Result<ReconciliationResult>::err(r.error());
+        }
     }
 
-    db.completeRun(runID, "SUCCESS");
-    std::cout << "[SUCCESS] Run completed.\n";
-    return true;
+    result.success = true;
+    SPDLOG_INFO("Run {} completed: {} orphans, {} missing", result.runId, result.orphanCount, result.missingCount);
+    return Result<ReconciliationResult>::ok(result);
 }

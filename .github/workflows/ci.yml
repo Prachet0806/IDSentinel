@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, upgrade]
+  pull_request:
+    branches: [main, upgrade]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_BINARY_SOURCES: "clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Release, Debug]
+        include:
+          - os: ubuntu-latest
+            vcpkg_triplet: x64-linux
+          - os: windows-latest
+            vcpkg_triplet: x64-windows
+          - os: macos-latest
+            vcpkg_triplet: x64-osx
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
+          vcpkgGitCommitId: 'rolling'
+          vcpkgArguments: 'install --feature-flags=manifests'
+          appendedCacheArgs: '--binarysource=clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite'
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
+
+      - name: Run clang-tidy
+        if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'
+        run: |
+          pip install clang-tidy-review
+          run-clang-tidy-18 -p build -checks='bugprone-*,performance-*,modernize-use-nullptr,modernize-use-emplace,modernize-use-equals-default,modernize-use-equals-delete,modernize-use-override,readability-identifier-naming,readability-magic-numbers,readability-function-cognitive-complexity,readability-container-size-empty' -header-filter='.*' -quiet
+
+      - name: Run cppcheck
+        if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'
+        run: |
+          cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/
