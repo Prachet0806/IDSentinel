@@ -2,12 +2,19 @@
 # Build Artifacts (CMake)
 # =========================
 /build/
+/build_coverage/
 /cmake-build-*/
 /CMakeCache.txt
 /CMakeFiles/
 /Makefile
 /cmake_install.cmake
 /compile_commands.json
+# Coverage instrumentation
+*.gcda
+*.gcno
+*.gcov
+coverage.xml
+coverage.json
 
 # =========================
 # Binaries
@@ -24,6 +31,9 @@
 /*.db-journal
 /*.db-wal
 /*.db-shm
+# Single-writer process lock files (<db>.lock)
+/*.db.lock
+*.lock
 
 
 # =========================
@@ -39,6 +49,7 @@
 # vcpkg
 # =========================
 /vcpkg/
+/vcpkg_installed/
 /vcpkg.exe
 /vcpkg.bat
 /vcpkg-cache/
@@ -55,6 +66,8 @@
 /.vs/
 /.vscode/
 /.idea/
+*.vcxproj.user
+*.suo
 *.swp
 *.swo
 *~

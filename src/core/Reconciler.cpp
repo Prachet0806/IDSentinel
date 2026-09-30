@@ -1,35 +1,55 @@
 #include "Reconciler.h"
+#include "config/Config.h"
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <random>
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <vector>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include <algorithm>
 
-Reconciler::Reconciler(IViolationStore& store, std::string_view hmacKey)
+Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const struct PolicyConfig* policy)
     : store_(store) {
-    orphanSeverity_ = Severity::Critical;
-    missingSeverity_ = Severity::Medium;
+    if (policy) {
+        orphanSeverity_ = policy->orphanSeverity;
+        missingSeverity_ = policy->missingSeverity;
+        driftSeverity_ = policy->driftSeverity;
+        SPDLOG_INFO("Policy configured: orphan={}, missing={}, drift={}",
+                    toString(orphanSeverity_), toString(missingSeverity_), toString(driftSeverity_));
+    } else {
+        orphanSeverity_ = Severity::Critical;
+        missingSeverity_ = Severity::Medium;
+        driftSeverity_ = Severity::High;
+        SPDLOG_WARN("No policy configured, using defaults: orphan=CRITICAL, missing=MEDIUM, drift=HIGH");
+    }
 
     if (!hmacKey.empty()) {
-        // Decode base64
+        // Decode base64 (EVP_DecodeBlock does not discount '=' padding)
         std::string decoded;
         decoded.resize(hmacKey.size());
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
                                   reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size());
+        if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
+        if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
         if (len == 32) {
             std::copy_n(reinterpret_cast<const uint8_t*>(decoded.data()), 32, hmacKey_.begin());
             hasHmacKey_ = true;
             SPDLOG_INFO("HMAC-SHA256 enabled for integrity hashes");
         } else {
-            SPDLOG_WARN("Invalid HMAC key length (decoded: {} bytes, expected 32), falling back to SHA-256", len);
+            throw std::runtime_error("Invalid HMAC key: decoded length is " + std::to_string(len) + " bytes, expected 32");
         }
     } else {
         SPDLOG_WARN("No HMAC key configured, using SHA-256 without secret (not tamper-proof)");
     }
+}
+
+Reconciler::~Reconciler() {
+    // Key material must not linger in memory after use.
+    OPENSSL_cleanse(hmacKey_.data(), hmacKey_.size());
 }
 
 std::string Reconciler::generateRunID() {
@@ -89,7 +109,7 @@ std::string Reconciler::hmacSha256(const uint8_t* key, size_t keyLen, std::strin
 }
 
 std::string Reconciler::computeHash(std::string_view uid, ViolationType type, Severity severity) {
-    std::string data = std::string(uid) + "|" + toString(type) + "|" + toString(severity);
+    std::string data = std::string(uid) + "|" + std::string(toString(type)) + "|" + std::string(toString(severity));
 
     if (hasHmacKey_) {
         return hmacSha256(hmacKey_.data(), hmacKey_.size(), data);
@@ -116,92 +136,142 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation(
     }
 
     auto runRecord = RunRecord{ result.runId, "HR_API", "TARGET_SYSTEM" };
-    if (mode != RunMode::DryRun) {
-        if (auto r = store_.startRun(runRecord); r.hasError()) {
+    if (mode != RunMode::DryRun && store_) {
+        if (auto r = store_->startRun(runRecord); r.hasError()) {
             return Result<ReconciliationResult>::err(r.error());
         }
-        if (auto r = store_.beginTransaction(); r.hasError()) {
-            store_.completeRun(result.runId, RunStatus::Failed);
+        if (auto r = store_->beginTransaction(); r.hasError()) {
+            // Secondary failure must not mask the primary error: log it.
+            if (auto rc = store_->completeRun(result.runId, RunStatus::Failed); rc.hasError()) {
+                SPDLOG_ERROR("Secondary failure marking run {} FAILED after beginTransaction error: {}",
+                             result.runId, rc.error().message);
+            }
             return Result<ReconciliationResult>::err(r.error());
         }
-        if (auto r = store_.prepareBulkInsert(); r.hasError()) {
-            store_.rollbackTransaction();
-            store_.completeRun(result.runId, RunStatus::Failed);
+        if (auto r = store_->prepareBulkInsert(); r.hasError()) {
+            if (auto rr = store_->rollbackTransaction(); rr.hasError()) {
+                SPDLOG_ERROR("Secondary rollback failure for run {}: {}", result.runId, rr.error().message);
+            }
+            if (auto rc = store_->completeRun(result.runId, RunStatus::Failed); rc.hasError()) {
+                SPDLOG_ERROR("Secondary failure marking run {} FAILED: {}", result.runId, rc.error().message);
+            }
             return Result<ReconciliationResult>::err(r.error());
         }
     }
 
     bool success = true;
 
+    // Deterministic order: unordered_map iteration order is unspecified, so
+    // sort IDs first. Finding IDs (AUTOINCREMENT) are then stable run to run.
+    std::vector<std::string> sortedTarget;
+    sortedTarget.reserve(targetSystem.size());
+    for (const auto& [id, _] : targetSystem) sortedTarget.push_back(id);
+    std::sort(sortedTarget.begin(), sortedTarget.end());
+
+    std::vector<std::string> sortedHr;
+    sortedHr.reserve(hrSource.size());
+    for (const auto& [id, _] : hrSource) sortedHr.push_back(id);
+    std::sort(sortedHr.begin(), sortedHr.end());
+
+    auto emitViolation = [&](const std::string& id, ViolationType type, Severity severity,
+                             const std::string& detail) -> bool {
+        std::string hash = computeHash(id, type, severity);
+        if (mode == RunMode::DryRun) {
+            SPDLOG_INFO("[DRY-RUN] {}: {} (ID: {})", std::string(toString(type)), detail, id);
+        } else if (store_) {
+            ViolationRecord vr{ id, type, severity };
+            if (auto r = store_->bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
+                SPDLOG_ERROR("Failed to log {} violation for {}: {}",
+                             std::string(toString(type)), id, r.error().message);
+                return false;
+            }
+            SPDLOG_WARN("{} Detected: {} (ID: {})", std::string(toString(type)), detail, id);
+        }
+        return true;
+    };
+
     // ORPHAN_ACCOUNT: in target but not in HR
-    for (const auto& [id, sysUser] : targetSystem) {
+    for (const auto& id : sortedTarget) {
         if (hrSource.find(id) == hrSource.end()) {
             ++result.orphanCount;
-            std::string hash = computeHash(id, ViolationType::OrphanAccount, orphanSeverity_);
-
-            if (mode == RunMode::DryRun) {
-                SPDLOG_INFO("[DRY-RUN] Orphan Account: {} (ID: {})", sysUser.name, id);
-            } else {
-                ViolationRecord vr{ id, ViolationType::OrphanAccount, orphanSeverity_ };
-                if (auto r = store_.bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
-                    SPDLOG_ERROR("Failed to log orphan violation for {}: {}", id, r.error().message);
-                    success = false;
-                    break;
-                }
-                SPDLOG_WARN("Orphan Account Detected: {} (ID: {})", sysUser.name, id);
+            if (!emitViolation(id, ViolationType::OrphanAccount, orphanSeverity_,
+                               targetSystem.at(id).name)) {
+                success = false;
+                break;
             }
         }
     }
 
     // MISSING_ACCOUNT: in HR but not in target
     if (success) {
-        for (const auto& [id, hrUser] : hrSource) {
+        for (const auto& id : sortedHr) {
             if (targetSystem.find(id) == targetSystem.end()) {
                 ++result.missingCount;
-                std::string hash = computeHash(id, ViolationType::MissingAccount, missingSeverity_);
-
-                if (mode == RunMode::DryRun) {
-                    SPDLOG_INFO("[DRY-RUN] Missing Account: {} (ID: {})", hrUser.name, id);
-                } else {
-                    ViolationRecord vr{ id, ViolationType::MissingAccount, missingSeverity_ };
-                    if (auto r = store_.bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
-                        SPDLOG_ERROR("Failed to log missing violation for {}: {}", id, r.error().message);
-                        success = false;
-                        break;
-                    }
+                if (!emitViolation(id, ViolationType::MissingAccount, missingSeverity_,
+                                   hrSource.at(id).name)) {
+                    success = false;
+                    break;
                 }
             }
         }
     }
 
-    if (mode != RunMode::DryRun) {
-        if (auto r = store_.finalizeBulkInsert(); r.hasError()) {
+    // ATTRIBUTE_DRIFT: present in both, but name or department differs.
+    if (success) {
+        for (const auto& id : sortedHr) {
+            auto targetIt = targetSystem.find(id);
+            if (targetIt == targetSystem.end()) continue;
+            const Identity& hrUser = hrSource.at(id);
+            const Identity& sysUser = targetIt->second;
+            if (hrUser.name != sysUser.name || hrUser.department != sysUser.department) {
+                ++result.driftCount;
+                std::string detail = "HR(name=" + hrUser.name + ",dept=" + hrUser.department +
+                                     ") vs target(name=" + sysUser.name + ",dept=" + sysUser.department + ")";
+                if (!emitViolation(id, ViolationType::AttributeDrift, driftSeverity_, detail)) {
+                    success = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (mode != RunMode::DryRun && store_) {
+        if (auto r = store_->finalizeBulkInsert(); r.hasError()) {
             SPDLOG_ERROR("Failed to finalize bulk insert: {}", r.error().message);
             success = false;
         }
     }
 
     if (!success) {
-        if (mode != RunMode::DryRun) {
-            store_.rollbackTransaction();
-            store_.completeRun(result.runId, RunStatus::Failed);
+        if (mode != RunMode::DryRun && store_) {
+            if (auto rr = store_->rollbackTransaction(); rr.hasError()) {
+                SPDLOG_ERROR("Secondary rollback failure for run {}: {}", result.runId, rr.error().message);
+            }
+            if (auto rc = store_->completeRun(result.runId, RunStatus::Failed); rc.hasError()) {
+                SPDLOG_ERROR("Secondary failure marking run {} FAILED: {}", result.runId, rc.error().message);
+            }
         }
         result.success = false;
         return Result<ReconciliationResult>::ok(result);
     }
 
-    if (mode != RunMode::DryRun) {
-        if (auto r = store_.commitTransaction(); r.hasError()) {
-            store_.rollbackTransaction();
-            store_.completeRun(result.runId, RunStatus::Failed);
+    if (mode != RunMode::DryRun && store_) {
+        if (auto r = store_->commitTransaction(); r.hasError()) {
+            if (auto rr = store_->rollbackTransaction(); rr.hasError()) {
+                SPDLOG_ERROR("Secondary rollback failure for run {}: {}", result.runId, rr.error().message);
+            }
+            if (auto rc = store_->completeRun(result.runId, RunStatus::Failed); rc.hasError()) {
+                SPDLOG_ERROR("Secondary failure marking run {} FAILED: {}", result.runId, rc.error().message);
+            }
             return Result<ReconciliationResult>::err(r.error());
         }
-        if (auto r = store_.completeRun(result.runId, RunStatus::Success); r.hasError()) {
+        if (auto r = store_->completeRun(result.runId, RunStatus::Success); r.hasError()) {
             return Result<ReconciliationResult>::err(r.error());
         }
     }
 
     result.success = true;
-    SPDLOG_INFO("Run {} completed: {} orphans, {} missing", result.runId, result.orphanCount, result.missingCount);
+    SPDLOG_INFO("Run {} completed: {} orphans, {} missing, {} drifted",
+                result.runId, result.orphanCount, result.missingCount, result.driftCount);
     return Result<ReconciliationResult>::ok(result);
 }

@@ -4,7 +4,8 @@
 
 enum class ViolationType {
     OrphanAccount,
-    MissingAccount
+    MissingAccount,
+    AttributeDrift
 };
 
 enum class Severity {
@@ -17,7 +18,8 @@ enum class Severity {
 enum class RunStatus {
     Running,
     Success,
-    Failed
+    Failed,
+    Abandoned
 };
 
 enum class FindingStatus {

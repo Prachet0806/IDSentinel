@@ -10,7 +10,13 @@
 
 class Reconciler {
 public:
-    explicit Reconciler(IViolationStore& store, std::string_view hmacKey = "");
+    explicit Reconciler(IViolationStore* store = nullptr,
+                       std::string_view hmacKey = "",
+                       const struct PolicyConfig* policy = nullptr);
+    ~Reconciler();
+
+    Reconciler(const Reconciler&) = delete;
+    Reconciler& operator=(const Reconciler&) = delete;
 
     enum class RunMode { Normal, DryRun };
 
@@ -18,6 +24,7 @@ public:
         std::string runId;
         size_t orphanCount = 0;
         size_t missingCount = 0;
+        size_t driftCount = 0;
         bool success = false;
     };
 
@@ -28,12 +35,13 @@ public:
     );
 
 private:
-    IViolationStore& store_;
+    IViolationStore* store_;
     std::array<uint8_t, 32> hmacKey_;
     bool hasHmacKey_ = false;
 
     Severity orphanSeverity_ = Severity::Critical;
     Severity missingSeverity_ = Severity::Medium;
+    Severity driftSeverity_ = Severity::High;
 
     std::string generateRunID();
     std::string computeHash(std::string_view uid, ViolationType type, Severity severity);

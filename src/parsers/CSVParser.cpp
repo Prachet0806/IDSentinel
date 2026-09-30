@@ -5,6 +5,7 @@
 #include <cctype>
 #include <algorithm>
 #include <filesystem>
+#include <spdlog/spdlog.h>
 
 namespace {
 std::string trimAndLower(std::string s) {
@@ -18,12 +19,13 @@ std::string trimAndLower(std::string s) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
 }
+}
 
-bool isHeaderLine(const std::string& line) {
+bool CSVParser::isHeaderLine(const std::string& line) {
     return trimAndLower(line) == "id,name,department";
 }
 
-std::vector<std::string> parseRow(const std::string& line) {
+std::vector<std::string> CSVParser::parseRow(const std::string& line) {
     std::vector<std::string> cols;
     std::string current;
     bool inQuotes = false;
@@ -50,35 +52,121 @@ std::vector<std::string> parseRow(const std::string& line) {
     }
     return cols;
 }
+
+namespace {
+// Column positions resolved either positionally (no header row) or by
+// header name (order-independent). -1 = unresolved (positional fallback).
+struct ColumnMap {
+    int id = 0;
+    int name = 1;
+    int department = 2;
+    bool fromHeader = false;
+};
+
+bool hasIdField(const std::vector<std::string>& cols) {
+    for (const auto& c : cols) {
+        if (trimAndLower(c) == "id") return true;
+    }
+    return false;
 }
 
-Result<std::unordered_map<std::string, Identity>> CSVParser::parse(const std::string& csv) {
-    std::unordered_map<std::string, Identity> identities;
-    std::stringstream ss(csv);
+// Fail-closed schema check (I1): a header row must name every required
+// column, otherwise the source's layout is unknown and parsing stops.
+Result<ColumnMap> mapHeaderColumns(const std::vector<std::string>& header) {
+    ColumnMap map;
+    map.id = map.name = map.department = -1;
+    for (size_t i = 0; i < header.size(); ++i) {
+        std::string h = trimAndLower(header[i]);
+        if (h == "id" && map.id < 0) map.id = static_cast<int>(i);
+        else if (h == "name" && map.name < 0) map.name = static_cast<int>(i);
+        else if (h == "department" && map.department < 0) map.department = static_cast<int>(i);
+    }
+    std::string missing;
+    if (map.id < 0) missing += "id ";
+    if (map.name < 0) missing += "name ";
+    if (map.department < 0) missing += "department ";
+    if (!missing.empty()) {
+        return Result<ColumnMap>::err(Error{ "VALIDATION_SCHEMA",
+            "CSV header is missing required column(s): " + missing });
+    }
+    map.fromHeader = true;
+    return Result<ColumnMap>::ok(map);
+}
+}
+
+Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
+    CSVParseResult result;
     std::string line;
     bool firstNonEmpty = true;
+    ColumnMap columns;
 
-    while (std::getline(ss, line)) {
+    while (std::getline(input, line)) {
         if (line.empty()) continue;
-
-        if (firstNonEmpty && isHeaderLine(line)) {
-            firstNonEmpty = false;
-            continue;
-        }
-        firstNonEmpty = false;
 
         std::vector<std::string> cols = parseRow(line);
 
-        if (cols.size() >= 3 && !cols[0].empty()) {
-            auto [it, inserted] = identities.try_emplace(cols[0], Identity{cols[0], cols[1], cols[2]});
-            if (!inserted) {
-                SPDLOG_WARN("Duplicate ID in CSV: {}, overwriting", cols[0]);
+        if (firstNonEmpty) {
+            firstNonEmpty = false;
+            if (isHeaderLine(line)) {
+                continue; // Legacy exact header: positional layout assumed.
             }
-        } else if (cols.size() > 0 && !cols[0].empty()) {
-            SPDLOG_WARN("Row has insufficient columns (got {}, need 3): {}", cols.size(), line);
+            if (hasIdField(cols)) {
+                // Header row with (possibly reordered) column names.
+                auto mapResult = mapHeaderColumns(cols);
+                if (mapResult.hasError()) {
+                    return Result<CSVParseResult>::err(mapResult.error());
+                }
+                columns = mapResult.value();
+                continue;
+            }
+        }
+        ++result.totalRows;
+
+        int need = std::max({columns.id, columns.name, columns.department});
+        if (static_cast<int>(cols.size()) > need) {
+            if (cols[columns.id].empty()) {
+                SPDLOG_WARN("Row has empty id: {}", line);
+                ++result.malformedRows;
+            } else {
+                auto [it, inserted] = result.identities.try_emplace(
+                    cols[columns.id],
+                    Identity{cols[columns.id], cols[columns.name], cols[columns.department]});
+                if (!inserted) {
+                    SPDLOG_WARN("Duplicate ID in CSV: {}, keeping first occurrence", cols[columns.id]);
+                    ++result.duplicateRows;
+                } else {
+                    ++result.validRows;
+                }
+            }
+        } else {
+            bool anyContent = false;
+            for (const auto& c : cols) {
+                if (!c.empty()) { anyContent = true; break; }
+            }
+            if (anyContent) {
+                SPDLOG_WARN("Row has insufficient columns (got {}, need {}): {}", cols.size(), need + 1, line);
+            }
+            ++result.malformedRows;
         }
     }
-    return Result<std::unordered_map<std::string, Identity>>::ok(std::move(identities));
+    return Result<CSVParseResult>::ok(std::move(result));
+}
+
+Result<CSVParseResult> CSVParser::parse(const std::string& csv) {
+    std::stringstream ss(csv);
+    return parseFromStream(ss);
+}
+
+Result<CSVParseResult> CSVParser::parseFile(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return Result<CSVParseResult>::err(Error{ "FILE_OPEN", "Unable to open file: " + path.string() });
+    }
+    auto result = parseFromStream(file);
+    if (file.bad()) {
+        return Result<CSVParseResult>::err(Error{ "FILE_READ", "Failed to read file: " + path.string() });
+    }
+    return result;
 }
 
 Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) {

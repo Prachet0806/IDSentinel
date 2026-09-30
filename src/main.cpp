@@ -1,8 +1,12 @@
 #include "cli/CLI.h"
 #include "core/Logging.h"
+#include "connectors/NetworkConnector.h"
 #include <spdlog/spdlog.h>
 
 int main(int argc, char* argv[]) {
+    // Process-scoped libcurl state: must outlive every NetworkConnector.
+    CurlGlobal curlGlobal;
+
     // Initialize minimal logging early for CLI parsing errors
     initLogging(LogFormat::Text, LogLevel::Warn, std::nullopt);
 

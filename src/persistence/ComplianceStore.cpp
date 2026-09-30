@@ -42,9 +42,14 @@ Result<void> ComplianceStore::bindInt(sqlite3_stmt* stmt, int index, int value) 
 }
 
 Result<void> ComplianceStore::init() {
-    std::filesystem::create_directories(dbPath_.parent_path());
+    std::string dbPathStr = dbPath_.string();
+    bool isMemory = (dbPathStr == ":memory:");
 
-    if (sqlite3_open(dbPath_.string().c_str(), &db_) != SQLITE_OK) {
+    if (!isMemory && !dbPath_.parent_path().empty()) {
+        std::filesystem::create_directories(dbPath_.parent_path());
+    }
+
+    if (sqlite3_open(dbPathStr.c_str(), &db_) != SQLITE_OK) {
         std::string err = db_ ? sqlite3_errmsg(db_) : "unknown";
         SPDLOG_ERROR("Failed to open database: {}", err);
         return Result<void>::err(Error{ "SQLITE_OPEN", err });
@@ -56,27 +61,52 @@ Result<void> ComplianceStore::init() {
     }
     if (auto r = execSimple("PRAGMA busy_timeout = " + std::to_string(busyTimeoutMs_) + ";", "Set busy timeout"); r.hasError()) return r;
 
+    // Clean-slate schema (I8-I11): immutable evidence is separated from
+    // mutable workflow status. Legacy tables from pre-split schema are
+    // dropped; evidence written under the old schema is not migrated.
     const char* schema = R"SQL(
+        DROP TABLE IF EXISTS compliance_findings;
+        DROP TABLE IF EXISTS violation_history;
+        DROP TRIGGER IF EXISTS trg_update_history;
+        DROP TRIGGER IF EXISTS trg_update_run_summary;
+
         CREATE TABLE IF NOT EXISTS recon_runs (
             run_id TEXT PRIMARY KEY,
             source_system TEXT NOT NULL,
             target_system TEXT NOT NULL,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
-            status TEXT CHECK(status IN ('RUNNING','SUCCESS','FAILED')),
-            total_violations INTEGER DEFAULT 0
+            status TEXT NOT NULL CHECK(status IN ('RUNNING','SUCCESS','FAILED','ABANDONED')),
+            total_violations INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS compliance_findings (
+        -- I8: immutable evidence. No UPDATE/DELETE allowed (see guard triggers).
+        CREATE TABLE IF NOT EXISTS finding_evidence (
             finding_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id TEXT NOT NULL,
+            run_id TEXT NOT NULL REFERENCES recon_runs(run_id),
             user_id TEXT NOT NULL,
-            violation_type TEXT NOT NULL,
-            severity TEXT CHECK(severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+            violation_type TEXT NOT NULL CHECK(violation_type IN ('ORPHAN_ACCOUNT','MISSING_ACCOUNT','ATTRIBUTE_DRIFT')),
+            severity TEXT NOT NULL CHECK(severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
             detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'OPEN',
-            integrity_hash TEXT,
-            FOREIGN KEY(run_id) REFERENCES recon_runs(run_id)
+            integrity_hash TEXT NOT NULL
+        );
+
+        -- I9: mutable workflow status, one row per finding.
+        CREATE TABLE IF NOT EXISTS finding_status (
+            finding_id INTEGER PRIMARY KEY REFERENCES finding_evidence(finding_id),
+            status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','REVIEW','REMEDIATED')),
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by TEXT NOT NULL DEFAULT 'system'
+        );
+
+        -- I9: every status transition is auditable.
+        CREATE TABLE IF NOT EXISTS finding_status_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            finding_id INTEGER NOT NULL REFERENCES finding_evidence(finding_id),
+            old_status TEXT NOT NULL,
+            new_status TEXT NOT NULL CHECK(new_status IN ('OPEN','REVIEW','REMEDIATED')),
+            changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            changed_by TEXT NOT NULL DEFAULT 'system'
         );
 
         CREATE TABLE IF NOT EXISTS violation_history (
@@ -84,16 +114,46 @@ Result<void> ComplianceStore::init() {
             violation_type TEXT NOT NULL,
             first_detected TIMESTAMP,
             last_detected TIMESTAMP,
-            occurrence_count INTEGER DEFAULT 1,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (user_id, violation_type)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_findings_run ON compliance_findings(run_id);
-        CREATE INDEX IF NOT EXISTS idx_findings_user ON compliance_findings(user_id);
-        CREATE INDEX IF NOT EXISTS idx_findings_type ON compliance_findings(violation_type);
+        CREATE INDEX IF NOT EXISTS idx_evidence_run ON finding_evidence(run_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_user ON finding_evidence(user_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_type ON finding_evidence(violation_type);
+        CREATE INDEX IF NOT EXISTS idx_status_history_finding ON finding_status_history(finding_id);
+
+        -- I8 enforcement: evidence rows can never be modified or removed.
+        CREATE TRIGGER IF NOT EXISTS trg_evidence_no_update
+        BEFORE UPDATE ON finding_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'finding_evidence is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_evidence_no_delete
+        BEFORE DELETE ON finding_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'finding_evidence is immutable');
+        END;
+
+        -- New evidence automatically enters the OPEN workflow state.
+        CREATE TRIGGER IF NOT EXISTS trg_evidence_init_status
+        AFTER INSERT ON finding_evidence
+        BEGIN
+            INSERT INTO finding_status (finding_id, status)
+            VALUES (NEW.finding_id, 'OPEN');
+        END;
+
+        -- I9 enforcement: every status change leaves an audit row.
+        CREATE TRIGGER IF NOT EXISTS trg_status_audit
+        AFTER UPDATE OF status ON finding_status
+        BEGIN
+            INSERT INTO finding_status_history (finding_id, old_status, new_status)
+            VALUES (OLD.finding_id, OLD.status, NEW.status);
+        END;
 
         CREATE TRIGGER IF NOT EXISTS trg_update_history
-        AFTER INSERT ON compliance_findings
+        AFTER INSERT ON finding_evidence
         BEGIN
             UPDATE violation_history
             SET last_detected = NEW.detected_at,
@@ -109,7 +169,7 @@ Result<void> ComplianceStore::init() {
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_update_run_summary
-        AFTER INSERT ON compliance_findings
+        AFTER INSERT ON finding_evidence
         BEGIN
             UPDATE recon_runs
             SET total_violations = total_violations + 1
@@ -117,7 +177,21 @@ Result<void> ComplianceStore::init() {
         END;
     )SQL";
 
-    return execSimple(schema, "Apply schema");
+    if (auto r = execSimple(schema, "Apply schema"); r.hasError()) return r;
+
+    // I11: any run still marked RUNNING belongs to a previous process that
+    // died without completing. It must never masquerade as successful.
+    if (auto r = execSimple(
+            "UPDATE recon_runs SET status='ABANDONED', completed_at=CURRENT_TIMESTAMP "
+            "WHERE status='RUNNING';",
+            "Abandon stale runs");
+        r.hasError()) return r;
+
+    int abandoned = sqlite3_changes(db_);
+    if (abandoned > 0) {
+        SPDLOG_WARN("Marked {} stale RUNNING run(s) as ABANDONED", abandoned);
+    }
+    return Result<void>::ok();
 }
 
 Result<void> ComplianceStore::startRun(const RunRecord& record) {
@@ -155,7 +229,7 @@ Result<void> ComplianceStore::completeRun(const std::string& runId, RunStatus st
 
     auto cleanup = [&] { sqlite3_finalize(stmt); };
 
-    if (auto r = bindText(stmt, 1, toString(status)); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 1, std::string(toString(status))); r.hasError()) { cleanup(); return r; }
     if (auto r = bindText(stmt, 2, runId); r.hasError()) { cleanup(); return r; }
 
     int rc = sqlite3_step(stmt);
@@ -163,6 +237,10 @@ Result<void> ComplianceStore::completeRun(const std::string& runId, RunStatus st
 
     if (rc != SQLITE_DONE) {
         return Result<void>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
+    }
+    // I10/I11: completing a nonexistent run must fail loudly, never silently.
+    if (sqlite3_changes(db_) != 1) {
+        return Result<void>::err(Error{ "RUN_NOT_FOUND", "No run found with run_id: " + runId });
     }
     return Result<void>::ok();
 }
@@ -196,7 +274,7 @@ Result<void> ComplianceStore::rollbackTransaction() {
 }
 
 Result<void> ComplianceStore::logViolation(const ViolationRecord& record, const std::string& runId, const std::string& integrityHash) {
-    const char* sql = "INSERT INTO compliance_findings (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
+    const char* sql = "INSERT INTO finding_evidence (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
 
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -207,8 +285,8 @@ Result<void> ComplianceStore::logViolation(const ViolationRecord& record, const 
 
     if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return r; }
     if (auto r = bindText(stmt, 2, record.userId); r.hasError()) { cleanup(); return r; }
-    if (auto r = bindText(stmt, 3, toString(record.type)); r.hasError()) { cleanup(); return r; }
-    if (auto r = bindText(stmt, 4, toString(record.severity)); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 3, std::string(toString(record.type))); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, 4, std::string(toString(record.severity))); r.hasError()) { cleanup(); return r; }
     if (auto r = bindText(stmt, 5, integrityHash); r.hasError()) { cleanup(); return r; }
 
     int rc = sqlite3_step(stmt);
@@ -221,7 +299,7 @@ Result<void> ComplianceStore::logViolation(const ViolationRecord& record, const 
 }
 
 Result<void> ComplianceStore::prepareBulkInsert() {
-    const char* sql = "INSERT INTO compliance_findings (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
+    const char* sql = "INSERT INTO finding_evidence (run_id, user_id, violation_type, severity, integrity_hash) VALUES (?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(db_, sql, -1, &bulkStmt_, nullptr) != SQLITE_OK) {
         return Result<void>::err(Error{ "SQLITE_PREPARE_BULK", sqlite3_errmsg(db_) });
     }
@@ -236,8 +314,8 @@ Result<void> ComplianceStore::bulkInsertViolation(const ViolationRecord& record,
 
     if (auto r = bindText(bulkStmt_, 1, runId); r.hasError()) return r;
     if (auto r = bindText(bulkStmt_, 2, record.userId); r.hasError()) return r;
-    if (auto r = bindText(bulkStmt_, 3, toString(record.type)); r.hasError()) return r;
-    if (auto r = bindText(bulkStmt_, 4, toString(record.severity)); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 3, std::string(toString(record.type))); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, 4, std::string(toString(record.severity))); r.hasError()) return r;
     if (auto r = bindText(bulkStmt_, 5, integrityHash); r.hasError()) return r;
 
     int rc = sqlite3_step(bulkStmt_);
@@ -253,4 +331,135 @@ Result<void> ComplianceStore::finalizeBulkInsert() {
         bulkStmt_ = nullptr;
     }
     return Result<void>::ok();
+}
+
+namespace {
+// NULL-safe text column reader. sqlite3_column_text returns nullptr for
+// SQL NULL; dereferencing it is undefined behavior.
+std::string columnText(sqlite3_stmt* stmt, int index) {
+    const unsigned char* text = sqlite3_column_text(stmt, index);
+    return text ? reinterpret_cast<const char*>(text) : "";
+}
+}
+
+Result<bool> ComplianceStore::runExists(const std::string& runId) {
+    const char* sql = "SELECT 1 FROM recon_runs WHERE run_id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<bool>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
+    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+    if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return Result<bool>::err(r.error()); }
+
+    int rc = sqlite3_step(stmt);
+    cleanup();
+    if (rc == SQLITE_ROW) return Result<bool>::ok(true);
+    if (rc == SQLITE_DONE) return Result<bool>::ok(false);
+    return Result<bool>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
+}
+
+Result<RunInfo> ComplianceStore::getRun(const std::string& runId) {
+    const char* sql = "SELECT run_id, source_system, target_system, started_at,"
+                      " completed_at, status, total_violations"
+                      " FROM recon_runs WHERE run_id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<RunInfo>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
+    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+    if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return Result<RunInfo>::err(r.error()); }
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+        cleanup();
+        return Result<RunInfo>::err(Error{ "RUN_NOT_FOUND", "No run found with run_id: " + runId });
+    }
+    if (rc != SQLITE_ROW) {
+        cleanup();
+        return Result<RunInfo>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
+    }
+    RunInfo info;
+    info.runId = columnText(stmt, 0);
+    info.sourceSystem = columnText(stmt, 1);
+    info.targetSystem = columnText(stmt, 2);
+    info.startedAt = columnText(stmt, 3);
+    info.completedAt = columnText(stmt, 4);
+    try {
+        info.status = runStatusFromString(columnText(stmt, 5));
+    } catch (const std::invalid_argument& e) {
+        cleanup();
+        return Result<RunInfo>::err(Error{ "DATA_CORRUPT", e.what() });
+    }
+    info.totalViolations = sqlite3_column_int(stmt, 6);
+    cleanup();
+    return Result<RunInfo>::ok(std::move(info));
+}
+
+Result<std::vector<FindingView>> ComplianceStore::queryFindings(
+    const std::string& runId, int limit, int offset
+) {
+    const char* sql =
+        "SELECT e.finding_id, e.run_id, e.user_id, e.violation_type, e.severity,"
+        " e.detected_at, s.status, e.integrity_hash"
+        " FROM finding_evidence e"
+        " JOIN finding_status s ON s.finding_id = e.finding_id"
+        " WHERE e.run_id = ?"
+        " ORDER BY e.finding_id LIMIT ? OFFSET ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<std::vector<FindingView>>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
+    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+    if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return Result<std::vector<FindingView>>::err(r.error()); }
+    if (auto r = bindInt(stmt, 2, limit); r.hasError()) { cleanup(); return Result<std::vector<FindingView>>::err(r.error()); }
+    if (auto r = bindInt(stmt, 3, offset); r.hasError()) { cleanup(); return Result<std::vector<FindingView>>::err(r.error()); }
+
+    std::vector<FindingView> findings;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        FindingView f;
+        f.findingId = sqlite3_column_int(stmt, 0);
+        f.runId = columnText(stmt, 1);
+        f.userId = columnText(stmt, 2);
+        try {
+            f.type = violationTypeFromString(columnText(stmt, 3));
+            f.severity = severityFromString(columnText(stmt, 4));
+        } catch (const std::invalid_argument& e) {
+            cleanup();
+            return Result<std::vector<FindingView>>::err(Error{ "DATA_CORRUPT", e.what() });
+        }
+        f.detectedAt = columnText(stmt, 5);
+        try {
+            f.status = findingStatusFromString(columnText(stmt, 6));
+        } catch (const std::invalid_argument& e) {
+            cleanup();
+            return Result<std::vector<FindingView>>::err(Error{ "DATA_CORRUPT", e.what() });
+        }
+        f.integrityHash = columnText(stmt, 7);
+        findings.push_back(std::move(f));
+    }
+    cleanup();
+    if (rc != SQLITE_DONE) {
+        return Result<std::vector<FindingView>>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
+    }
+    return Result<std::vector<FindingView>>::ok(std::move(findings));
+}
+
+Result<int> ComplianceStore::countFindings(const std::string& runId) {
+    const char* sql = "SELECT COUNT(*) FROM finding_evidence WHERE run_id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return Result<int>::err(Error{ "SQLITE_PREPARE", sqlite3_errmsg(db_) });
+    }
+    auto cleanup = [&] { sqlite3_finalize(stmt); };
+    if (auto r = bindText(stmt, 1, runId); r.hasError()) { cleanup(); return Result<int>::err(r.error()); }
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        cleanup();
+        return Result<int>::err(Error{ "SQLITE_EXEC", sqlite3_errmsg(db_) });
+    }
+    int count = sqlite3_column_int(stmt, 0);
+    cleanup();
+    return Result<int>::ok(count);
 }

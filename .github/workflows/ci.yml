@@ -6,12 +6,17 @@ on:
   pull_request:
     branches: [main, upgrade]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
+    # NOTE: the `runner` context is not available in job-level `env`
+    # (GitHub rejects it at parse time), so paths here use `github.workspace`.
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-      VCPKG_BINARY_SOURCES: "clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite"
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite"
     strategy:
       fail-fast: false
       matrix:
@@ -23,7 +28,7 @@ jobs:
           - os: windows-latest
             vcpkg_triplet: x64-windows
           - os: macos-latest
-            vcpkg_triplet: x64-osx
+            vcpkg_triplet: arm64-osx
 
     steps:
       - name: Checkout repository
@@ -32,20 +37,29 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'rolling'
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '58845ed63eb19aff55e896ea1f5d51f2a0df5b66'
           vcpkgArguments: 'install --feature-flags=manifests'
-          appendedCacheArgs: '--binarysource=clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite'
+          appendedCacheArgs: '--binarysource=clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite'
 
       - name: Configure CMake
+        # bash everywhere: backslash continuations are not valid PowerShell.
+        shell: bash
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
 
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure -j$(nproc)
+        # -C is required on multi-config generators (Visual Studio);
+        # harmless on single-config ones. bash for the nproc fallback chain.
+        shell: bash
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --parallel $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
       - name: Run clang-tidy
         if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'

@@ -2,6 +2,8 @@
 hr_feed_url = "https://gist.githubusercontent.com/dummy/raw/hr_feed.csv"
 timeout_seconds = 10
 ca_bundle_path = ""
+max_response_mb = 10
+max_retries = 3
 
 [database]
 path = ""
@@ -11,6 +13,10 @@ busy_timeout_ms = 5000
 [policy]
 orphan_severity = "CRITICAL"
 missing_severity = "MEDIUM"
+drift_severity = "HIGH"
+
+[source]
+max_file_age_hours = 0
 
 [logging]
 level = "info"

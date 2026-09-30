@@ -5,12 +5,17 @@ on:
     - cron: '0 2 * * *'  # 2 AM UTC daily
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   strict-analysis:
     runs-on: ubuntu-latest
+    # NOTE: the `runner` context is not available in job-level `env`
+    # (GitHub rejects it at parse time), so paths here use `github.workspace`.
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-      VCPKG_BINARY_SOURCES: "clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite"
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,13 +23,13 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'rolling'
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '58845ed63eb19aff55e896ea1f5d51f2a0df5b66'
           vcpkgArguments: 'install --feature-flags=manifests'
-          appendedCacheArgs: '--binarysource=clear;files,${{ runner.temp }}/vcpkg-binary-cache,readwrite'
+          appendedCacheArgs: '--binarysource=clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite'
 
       - name: Configure CMake
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -38,9 +43,12 @@ jobs:
         run: |
           cppcheck --enable=all --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/ || true
 
+      - name: Install coverage tools
+        run: pip install gcovr
+
       - name: Run tests with coverage
         run: |
-          cmake -S . -B build_coverage -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="--coverage"
+          cmake -S . -B build_coverage -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="--coverage" -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
           cmake --build build_coverage --config Debug --parallel
           ctest --test-dir build_coverage --output-on-failure
           gcovr --root . --filter 'src/.*' --exclude 'tests/.*' --print-summary
@@ -56,11 +64,11 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'rolling'
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '58845ed63eb19aff55e896ea1f5d51f2a0df5b66'
           vcpkgArguments: 'install --feature-flags=manifests'
 
       - name: Check for outdated packages
         run: |
-          cd ${{ runner.temp }}/vcpkg
+          cd ${{ github.workspace }}/vcpkg
           ./vcpkg outdated

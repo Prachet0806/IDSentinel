@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Generate 'compile_commands.json' (Critical for VS Code / CLion IntelliSense)
-set(CMAKE_EXPORT_COMPILE_COMPILE_COMMANDS ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- 2. Compiler Warnings ---
 if(MSVC)
@@ -27,29 +27,31 @@ find_package(fmt CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # --- 4. Source Management ---
-set(SOURCES
-    src/main.cpp
+# NOTE: src/main.cpp is intentionally excluded from the library so that
+# the Catch2 test binary (which provides its own main) can link IDSentinelLib.
+set(IDSentinel_SOURCES
     src/cli/CLI.cpp
     src/config/Config.cpp
     src/core/Logging.cpp
+    src/core/ProcessLock.cpp
     src/core/Reconciler.cpp
+    src/core/SourceValidator.cpp
+    src/core/Policy.cpp
     src/connectors/NetworkConnector.cpp
     src/parsers/CSVParser.cpp
     src/persistence/ComplianceStore.cpp
 )
 
-# --- 5. Build Target ---
-add_executable(IDSentinel ${SOURCES})
+# --- 5. Build Library Target ---
+add_library(IDSentinelLib ${IDSentinel_SOURCES})
 
-# --- 6. Include Paths ---
-target_include_directories(IDSentinel
-    PRIVATE
+target_include_directories(IDSentinelLib
+    PUBLIC
         src
 )
 
-# --- 7. Linkage ---
-target_link_libraries(IDSentinel
-    PRIVATE
+target_link_libraries(IDSentinelLib
+    PUBLIC
         CURL::libcurl
         SQLite::SQLite3
         OpenSSL::Crypto
@@ -60,12 +62,18 @@ target_link_libraries(IDSentinel
         nlohmann_json::nlohmann_json
 )
 
-# --- 8. Output Management ---
+# --- 6. Build Executable ---
+add_executable(IDSentinel src/main.cpp)
+target_link_libraries(IDSentinel PRIVATE IDSentinelLib)
+
+# --- 7. Output Management ---
 set_target_properties(IDSentinel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# --- 9. Testing ---
+# --- 8. Testing ---
+option(BUILD_TESTING "Build tests" ON)
+include(CTest)
 enable_testing()
 if(BUILD_TESTING)
     find_package(Catch2 CONFIG REQUIRED)

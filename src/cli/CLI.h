@@ -9,8 +9,11 @@ struct CLIOptions {
     enum class Command { Reconcile, Inspect, Config, Keygen } command = Command::Reconcile;
     std::optional<std::filesystem::path> configPath;
     bool dryRun = false;
+    bool allowEmptyTarget = false;
     std::string runId;
     std::string inspectFormat = "table";
+    int inspectLimit = 100;
+    int inspectOffset = 0;
     int keyBits = 256;
     std::string keyFormat = "base64";
     bool validateOnly = false;

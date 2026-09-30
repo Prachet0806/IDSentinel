@@ -1,10 +1,12 @@
 #include "Policy.h"
 #include <array>
+#include <stdexcept>
 
 std::string_view toString(ViolationType v) noexcept {
     switch (v) {
         case ViolationType::OrphanAccount: return "ORPHAN_ACCOUNT";
         case ViolationType::MissingAccount: return "MISSING_ACCOUNT";
+        case ViolationType::AttributeDrift: return "ATTRIBUTE_DRIFT";
     }
     return "UNKNOWN";
 }
@@ -24,6 +26,7 @@ std::string_view toString(RunStatus rs) noexcept {
         case RunStatus::Running: return "RUNNING";
         case RunStatus::Success: return "SUCCESS";
         case RunStatus::Failed: return "FAILED";
+        case RunStatus::Abandoned: return "ABANDONED";
     }
     return "UNKNOWN";
 }
@@ -40,6 +43,7 @@ std::string_view toString(FindingStatus fs) noexcept {
 ViolationType violationTypeFromString(std::string_view s) {
     if (s == "ORPHAN_ACCOUNT") return ViolationType::OrphanAccount;
     if (s == "MISSING_ACCOUNT") return ViolationType::MissingAccount;
+    if (s == "ATTRIBUTE_DRIFT") return ViolationType::AttributeDrift;
     throw std::invalid_argument("Unknown violation type: " + std::string(s));
 }
 
@@ -55,6 +59,7 @@ RunStatus runStatusFromString(std::string_view s) {
     if (s == "RUNNING") return RunStatus::Running;
     if (s == "SUCCESS") return RunStatus::Success;
     if (s == "FAILED") return RunStatus::Failed;
+    if (s == "ABANDONED") return RunStatus::Abandoned;
     throw std::invalid_argument("Unknown run status: " + std::string(s));
 }
 

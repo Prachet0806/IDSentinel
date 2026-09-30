@@ -19,6 +19,11 @@ add_executable(idsentinel_tests
     test_reconciler.cpp
     test_compliance_store.cpp
     test_config.cpp
+    test_source_validator.cpp
+    test_network_connector.cpp
+    test_logging.cpp
+    test_cli.cpp
+    test_process_lock.cpp
     mocks/MockViolationStore.cpp
 )
 
@@ -28,6 +33,7 @@ target_include_directories(idsentinel_tests PRIVATE
 )
 
 target_link_libraries(idsentinel_tests PRIVATE
+    IDSentinelLib
     Catch2::Catch2WithMain
     spdlog::spdlog
     tomlplusplus::tomlplusplus

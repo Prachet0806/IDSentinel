@@ -26,4 +26,9 @@ public:
     virtual Result<void> commitTransaction() = 0;
     virtual Result<void> rollbackTransaction() = 0;
     virtual Result<void> completeRun(const std::string& runId, RunStatus status) = 0;
+
+    // Bulk operations for performance
+    virtual Result<void> prepareBulkInsert() = 0;
+    virtual Result<void> bulkInsertViolation(const ViolationRecord& record, const std::string& runId, const std::string& integrityHash) = 0;
+    virtual Result<void> finalizeBulkInsert() = 0;
 };
