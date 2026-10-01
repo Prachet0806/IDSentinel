@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <array>
+#include <cstdint>
 
 class Reconciler {
 public:
@@ -34,9 +35,12 @@ public:
         RunMode mode = RunMode::Normal
     );
 
+    // Static method for external verification
+    static std::string verifyHash(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey);
+
 private:
     IViolationStore* store_;
-    std::array<uint8_t, 32> hmacKey_;
+    std::array<std::uint8_t, 32> hmacKey_;
     bool hasHmacKey_ = false;
 
     Severity orphanSeverity_ = Severity::Critical;
@@ -45,6 +49,7 @@ private:
 
     std::string generateRunID();
     std::string computeHash(std::string_view uid, ViolationType type, Severity severity);
-    static std::string hmacSha256(const uint8_t* key, size_t keyLen, std::string_view data);
+    static std::string computeHashStatic(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey);
+    static std::string hmacSha256(const std::uint8_t* key, size_t keyLen, std::string_view data);
     static std::string sha256(std::string_view data);
 };

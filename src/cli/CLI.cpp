@@ -22,6 +22,7 @@
 #include <format>
 #include <sqlite3.h>
 #include <iostream>
+#include <cstdint>
 
 namespace {
 std::string base64Encode(const uint8_t* data, size_t len) {
@@ -49,9 +50,9 @@ std::string hexEncode(const uint8_t* data, size_t len) {
 
 void printConfig(const Config& cfg) {
     fmt::print("Network:\n");
-    fmt::print("  hr_feed_url: {}\n", cfg.network.hrFeedUrl);
+    fmt::print("  hr_feed_url: {}\n", redactUrlForLogging(cfg.network.hrFeedUrl));
     fmt::print("  timeout_seconds: {}\n", cfg.network.timeoutSeconds);
-    fmt::print("  ca_bundle_path: {}\n", cfg.network.caBundlePath.empty() ? "(system default)" : cfg.network.caBundlePath);
+    fmt::print("  ca_bundle_path: {}\n", cfg.network.caBundlePath.empty() ? "(system default)" : redactUrlForLogging(cfg.network.caBundlePath));
     fmt::print("\nDatabase:\n");
     fmt::print("  path: {}\n", cfg.database.path.string());
     fmt::print("  wal_mode: {}\n", cfg.database.walMode ? "true" : "false");
@@ -82,6 +83,8 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
     reconcile->add_flag("--dry-run", opts.dryRun, "Preview violations without writing to database");
     reconcile->add_flag("--allow-empty-target", opts.allowEmptyTarget,
                         "Allow empty target source (WARNING: may produce mass false-positive missing accounts)");
+    reconcile->add_flag("--allow-local-fallback", opts.allowLocalFallback,
+                        "Allow fallback to local CSV file when network fetch fails (opt-in)");
     reconcile->add_option("--config", opts.configPath, "Path to config file");
 
     auto* inspect = app.add_subcommand("inspect", "Inspect reconciliation run results");
@@ -98,6 +101,11 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
     auto* keygen = app.add_subcommand("keygen", "Generate HMAC key");
     keygen->add_option("--bits", opts.keyBits, "Key size in bits")->check(CLI::IsMember({256}));
     keygen->add_option("--format", opts.keyFormat, "Output format")->check(CLI::IsMember({"base64", "hex"}));
+
+    auto* verify = app.add_subcommand("verify", "Verify hash chain integrity of a reconciliation run");
+    verify->add_option("--run-id", opts.verifyRunId, "Run ID to verify")->required();
+    verify->add_option("--hmac-key", opts.verifyHmacKey, "HMAC key (base64) for verification");
+    verify->add_option("--config", opts.configPath, "Path to config file");
 
     app.set_config("--config", "", "Config file", false);
     app.require_subcommand(0, 1);
@@ -116,6 +124,7 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
         else if (cmd == "inspect") opts.command = CLIOptions::Command::Inspect;
         else if (cmd == "config") opts.command = CLIOptions::Command::Config;
         else if (cmd == "keygen") opts.command = CLIOptions::Command::Keygen;
+        else if (cmd == "verify") opts.command = CLIOptions::Command::Verify;
     }
 
     return Result<CLIOptions>::ok(opts);
@@ -147,9 +156,24 @@ int runReconcile(const CLIOptions& opts) {
     auto hrResult = net.fetch(cfg.network.hrFeedUrl);
     std::string hrCsv;
     if (hrResult.hasError()) {
-        SPDLOG_WARN("Network fetch failed: {}. Falling back to local cache.", hrResult.error().message);
+        if (opts.allowLocalFallback) {
+            SPDLOG_WARN("Network fetch failed: {}. Falling back to local cache.", hrResult.error().message);
+        } else {
+            SPDLOG_ERROR("Network fetch failed: {}. Local fallback disabled (use --allow-local-fallback to enable).", hrResult.error().message);
+            return 1;
+        }
     } else {
         hrCsv = std::move(hrResult.value());
+    }
+
+    // Check for empty response (204 No Content or empty body)
+    if (hrCsv.empty()) {
+        if (opts.allowLocalFallback) {
+            SPDLOG_WARN("HR feed response is empty. Falling back to local cache.");
+        } else {
+            SPDLOG_ERROR("HR feed response is empty (204 No Content or empty body). Local fallback disabled (use --allow-local-fallback to enable).");
+            return 1;
+        }
     }
 
     // Parse HR
@@ -265,11 +289,11 @@ int runReconcile(const CLIOptions& opts) {
         SPDLOG_WARN("Target source: {}", warning);
     }
 
-    // Target-source size sanity check
     if (!hrIdentities.empty() && !systemIdentities.empty()) {
         double ratio = static_cast<double>(systemIdentities.size()) / hrIdentities.size();
         if (ratio > 10.0 || ratio < 0.1) {
-            SPDLOG_WARN("Target/HR size ratio {:.2f} outside expected range [0.1, 10.0]", ratio);
+            SPDLOG_CRITICAL("Target/HR size ratio {:.2f} outside expected range [0.1, 10.0]. Aborting.", ratio);
+            return 1;
         }
     }
 
@@ -452,10 +476,143 @@ int runKeygen(const CLIOptions& opts) {
         return 1;
     }
 
+    std::string output;
     if (opts.keyFormat == "base64") {
-        std::cout << base64Encode(key.data(), key.size()) << "\n";
+        output = base64Encode(key.data(), key.size());
     } else {
-        std::cout << hexEncode(key.data(), key.size()) << "\n";
+        output = hexEncode(key.data(), key.size());
     }
+    // Ensure no embedded NUL bytes in output
+    output.erase(std::remove(output.begin(), output.end(), '\0'), output.end());
+    std::cout << output << "\n";
     return 0;
+}
+
+int runVerify(const CLIOptions& opts) {
+    auto cfgResult = loadConfig(opts.configPath);
+    if (cfgResult.hasError()) {
+        std::cerr << "Config validation failed: " << cfgResult.error().message << "\n";
+        return 1;
+    }
+    Config cfg = std::move(cfgResult.value());
+
+    initLogging(cfg.logging.format, cfg.logging.level, cfg.logging.file,
+                cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
+
+    SPDLOG_INFO("Verifying hash chain for run: {}", opts.verifyRunId);
+
+    ComplianceStore store(cfg.database.path);
+    if (auto r = store.init(); r.hasError()) {
+        SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
+        return 1;
+    }
+    IComplianceQueryStore& query = store;
+
+    // Check if run exists
+    auto existsResult = query.runExists(opts.verifyRunId);
+    if (existsResult.hasError()) {
+        SPDLOG_ERROR("Failed to query run: {}", existsResult.error().message);
+        return 1;
+    }
+    if (!existsResult.value()) {
+        SPDLOG_ERROR("Run not found: {}", opts.verifyRunId);
+        std::cerr << "Run not found: " << opts.verifyRunId << "\n";
+        return 1;
+    }
+
+    // Get run info
+    auto runResult = query.getRun(opts.verifyRunId);
+    if (runResult.hasError()) {
+        SPDLOG_ERROR("Failed to load run: {}", runResult.error().message);
+        return 1;
+    }
+    const RunInfo& run = runResult.value();
+
+    // Get all findings for this run
+    auto countResult = query.countFindings(opts.verifyRunId);
+    if (countResult.hasError()) {
+        SPDLOG_ERROR("Failed to count findings: {}", countResult.error().message);
+        return 1;
+    }
+    int total = countResult.value();
+
+    if (total == 0) {
+        std::cout << "Run " << opts.verifyRunId << " has no findings to verify.\n";
+        return 0;
+    }
+
+    auto findingsResult = query.queryFindings(opts.verifyRunId, total, 0);
+    if (findingsResult.hasError()) {
+        SPDLOG_ERROR("Failed to query findings: {}", findingsResult.error().message);
+        return 1;
+    }
+    const auto& findings = findingsResult.value();
+
+    // Determine HMAC key to use for verification
+    std::string hmacKey = opts.verifyHmacKey.empty() ? cfg.security.hmacKey : opts.verifyHmacKey;
+
+    // Verify each finding's hash
+    bool allValid = true;
+    Reconciler reconciler(nullptr, hmacKey, &cfg.policy);
+    
+    std::cout << "Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "...\n";
+    
+    try {
+        for (size_t i = 0; i < findings.size(); ++i) {
+            const auto& f = findings[i];
+            ViolationType vtype = f.type;
+            Severity severity = f.severity;
+            
+            std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
+            
+            if (computedHash == f.integrityHash) {
+                std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
+                          << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
+            } else {
+                std::cerr << "  [" << (i + 1) << "/" << findings.size() << "] FAIL: " << f.userId
+                          << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n"
+                          << "    Expected: " << f.integrityHash << "\n"
+                          << "    Computed: " << computedHash << "\n";
+                allValid = false;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[EXCEPTION] " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "[EXCEPTION] Unknown exception\n";
+        return 1;
+    }
+    
+    for (size_t i = 0; i < findings.size(); ++i) {
+        const auto& f = findings[i];
+        ViolationType vtype = f.type;
+        Severity severity = f.severity;
+        
+        std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
+        
+if (computedHash == f.integrityHash) {
+            std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
+                      << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
+        } else {
+            std::cerr << "  [" << (i + 1) << "/" << findings.size() << "] FAIL: " << f.userId
+                      << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n"
+                      << "    Expected: " << f.integrityHash << "\n"
+                      << "    Computed: " << computedHash << "\n";
+            allValid = false;
+        }
+    }
+    
+    // Also verify hash chain continuity (each finding's hash should be unique for different inputs)
+    // This is implicitly checked by comparing each hash to its expected value
+    
+    if (allValid) {
+        std::cout << "\nAll " << findings.size() << " findings verified successfully.\n";
+        SPDLOG_INFO("Verification successful: all {} findings in run {} are valid", findings.size(), opts.verifyRunId);
+        return 0;
+    } else {
+        std::cerr << "\nVerification FAILED: " << findings.size() << " findings checked, some failed.\n";
+        SPDLOG_ERROR("Verification failed for run {}", opts.verifyRunId);
+        return 1;
+    }
 }

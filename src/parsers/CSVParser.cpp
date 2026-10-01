@@ -54,14 +54,18 @@ std::vector<std::string> CSVParser::parseRow(const std::string& line) {
 }
 
 namespace {
+#include <limits>
+
 // Column positions resolved either positionally (no header row) or by
-// header name (order-independent). -1 = unresolved (positional fallback).
+// header name (order-independent). max() = unresolved (positional fallback).
 struct ColumnMap {
-    int id = 0;
-    int name = 1;
-    int department = 2;
+    std::size_t id = 0;
+    std::size_t name = 1;
+    std::size_t department = 2;
     bool fromHeader = false;
 };
+
+static constexpr std::size_t INVALID_IDX = std::numeric_limits<std::size_t>::max();
 
 bool hasIdField(const std::vector<std::string>& cols) {
     for (const auto& c : cols) {
@@ -74,17 +78,17 @@ bool hasIdField(const std::vector<std::string>& cols) {
 // column, otherwise the source's layout is unknown and parsing stops.
 Result<ColumnMap> mapHeaderColumns(const std::vector<std::string>& header) {
     ColumnMap map;
-    map.id = map.name = map.department = -1;
+    map.id = map.name = map.department = INVALID_IDX;
     for (size_t i = 0; i < header.size(); ++i) {
         std::string h = trimAndLower(header[i]);
-        if (h == "id" && map.id < 0) map.id = static_cast<int>(i);
-        else if (h == "name" && map.name < 0) map.name = static_cast<int>(i);
-        else if (h == "department" && map.department < 0) map.department = static_cast<int>(i);
+        if (h == "id" && map.id == INVALID_IDX) map.id = i;
+        else if (h == "name" && map.name == INVALID_IDX) map.name = i;
+        else if (h == "department" && map.department == INVALID_IDX) map.department = i;
     }
     std::string missing;
-    if (map.id < 0) missing += "id ";
-    if (map.name < 0) missing += "name ";
-    if (map.department < 0) missing += "department ";
+    if (map.id == INVALID_IDX) missing += "id ";
+    if (map.name == INVALID_IDX) missing += "name ";
+    if (map.department == INVALID_IDX) missing += "department ";
     if (!missing.empty()) {
         return Result<ColumnMap>::err(Error{ "VALIDATION_SCHEMA",
             "CSV header is missing required column(s): " + missing });
@@ -99,8 +103,20 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
     std::string line;
     bool firstNonEmpty = true;
     ColumnMap columns;
+    size_t lineNumber = 0;
 
     while (std::getline(input, line)) {
+        ++lineNumber;
+        if (line.empty()) continue;
+
+        // Strip UTF-8 BOM if present on first line
+        if (lineNumber == 1 && line.size() >= 3 && 
+            static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line = line.substr(3);
+        }
+
         if (line.empty()) continue;
 
         std::vector<std::string> cols = parseRow(line);
@@ -123,9 +139,9 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
         ++result.totalRows;
 
         int need = std::max({columns.id, columns.name, columns.department});
-        if (static_cast<int>(cols.size()) > need) {
+        if (cols.size() > static_cast<std::size_t>(need)) {
             if (cols[columns.id].empty()) {
-                SPDLOG_WARN("Row has empty id: {}", line);
+                result.quarantinedRows.push_back({lineNumber, line, "empty id"});
                 ++result.malformedRows;
             } else {
                 auto [it, inserted] = result.identities.try_emplace(
@@ -144,7 +160,9 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
                 if (!c.empty()) { anyContent = true; break; }
             }
             if (anyContent) {
-                SPDLOG_WARN("Row has insufficient columns (got {}, need {}): {}", cols.size(), need + 1, line);
+                result.quarantinedRows.push_back({lineNumber, line, "insufficient columns (got " + std::to_string(cols.size()) + ", need " + std::to_string(need + 1) + ")"});
+            } else {
+                result.quarantinedRows.push_back({lineNumber, line, "empty row"});
             }
             ++result.malformedRows;
         }

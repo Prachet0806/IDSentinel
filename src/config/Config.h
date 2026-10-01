@@ -2,6 +2,7 @@
 #include <string>
 #include <optional>
 #include <filesystem>
+#include <toml++/toml.h>
 #include "core/Policy.h"
 #include "core/Logging.h"
 #include "core/Result.h"
@@ -67,7 +68,7 @@ std::filesystem::path getDefaultDatabasePath();
 std::filesystem::path getDefaultLogDirectory();
 
 // Config parsing functions (for testing)
-LogLevel parseLogLevel(const std::string& s);
-LogFormat parseLogFormat(const std::string& s);
-Severity parseSeverity(const std::string& s);
-Severity parseSeverity(const std::string& s);
+Result<LogLevel> parseLogLevel(const std::string& s);
+Result<LogFormat> parseLogFormat(const std::string& s);
+Result<Severity> parseSeverity(const std::string& s);
+Result<void> parseConfig(const toml::table& tbl, Config& cfg);

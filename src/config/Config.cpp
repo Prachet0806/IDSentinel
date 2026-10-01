@@ -35,58 +35,100 @@ std::string toUpper(std::string s) {
 }
 }
 
-LogLevel parseLogLevel(const std::string& s) {
+Result<LogLevel> parseLogLevel(const std::string& s) {
     auto u = toUpper(s);
-    if (u == "TRACE") return LogLevel::Trace;
-    if (u == "DEBUG") return LogLevel::Debug;
-    if (u == "INFO") return LogLevel::Info;
-    if (u == "WARN" || u == "WARNING") return LogLevel::Warn;
-    if (u == "ERROR") return LogLevel::Error;
-    if (u == "CRITICAL") return LogLevel::Critical;
-    return LogLevel::Info;
+    if (u == "TRACE") return Result<LogLevel>::ok(LogLevel::Trace);
+    if (u == "DEBUG") return Result<LogLevel>::ok(LogLevel::Debug);
+    if (u == "INFO") return Result<LogLevel>::ok(LogLevel::Info);
+    if (u == "WARN" || u == "WARNING") return Result<LogLevel>::ok(LogLevel::Warn);
+    if (u == "ERROR") return Result<LogLevel>::ok(LogLevel::Error);
+    if (u == "CRITICAL") return Result<LogLevel>::ok(LogLevel::Critical);
+    return Result<LogLevel>::err(Error{ "CONFIG", "Invalid log level: " + s });
 }
 
-LogFormat parseLogFormat(const std::string& s) {
+Result<LogFormat> parseLogFormat(const std::string& s) {
     auto u = toUpper(s);
-    if (u == "JSON") return LogFormat::Json;
-    if (u == "TEXT") return LogFormat::Text;
-    return LogFormat::Json;
+    if (u == "JSON") return Result<LogFormat>::ok(LogFormat::Json);
+    if (u == "TEXT") return Result<LogFormat>::ok(LogFormat::Text);
+    return Result<LogFormat>::err(Error{ "CONFIG", "Invalid log format: " + s });
 }
 
-Severity parseSeverity(const std::string& s) {
+Result<Severity> parseSeverity(const std::string& s) {
     auto u = toUpper(s);
-    if (u == "CRITICAL") return Severity::Critical;
-    if (u == "HIGH") return Severity::High;
-    if (u == "MEDIUM") return Severity::Medium;
-    if (u == "LOW") return Severity::Low;
-    return Severity::Medium;
+    if (u == "CRITICAL") return Result<Severity>::ok(Severity::Critical);
+    if (u == "HIGH") return Result<Severity>::ok(Severity::High);
+    if (u == "MEDIUM") return Result<Severity>::ok(Severity::Medium);
+    if (u == "LOW") return Result<Severity>::ok(Severity::Low);
+    return Result<Severity>::err(Error{ "CONFIG", "Invalid severity: " + s });
 }
 
-void applyEnvOverrides(Config& cfg) {
+Result<void> applyEnvOverrides(Config& cfg) {
     if (auto v = getEnv("IDSENTINEL_NETWORK__HR_FEED_URL"); !v.empty()) cfg.network.hrFeedUrl = v;
-    if (auto v = getEnv("IDSENTINEL_NETWORK__TIMEOUT_SECONDS"); !v.empty()) cfg.network.timeoutSeconds = std::stoi(v);
+    if (auto v = getEnv("IDSENTINEL_NETWORK__TIMEOUT_SECONDS"); !v.empty()) {
+        try { cfg.network.timeoutSeconds = std::stoi(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid timeout value: " + v }); }
+    }
     if (auto v = getEnv("IDSENTINEL_NETWORK__CA_BUNDLE_PATH"); !v.empty()) cfg.network.caBundlePath = v;
-    if (auto v = getEnv("IDSENTINEL_NETWORK__MAX_RESPONSE_MB"); !v.empty()) cfg.network.maxResponseMb = std::stoi(v);
-    if (auto v = getEnv("IDSENTINEL_NETWORK__MAX_RETRIES"); !v.empty()) cfg.network.maxRetries = std::stoi(v);
+    if (auto v = getEnv("IDSENTINEL_NETWORK__MAX_RESPONSE_MB"); !v.empty()) {
+        try { cfg.network.maxResponseMb = std::stoi(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid max_response_mb value: " + v }); }
+    }
+    if (auto v = getEnv("IDSENTINEL_NETWORK__MAX_RETRIES"); !v.empty()) {
+        try { cfg.network.maxRetries = std::stoi(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid max_retries value: " + v }); }
+    }
 
     if (auto v = getEnv("IDSENTINEL_DATABASE__PATH"); !v.empty()) cfg.database.path = expandPath(v);
     if (auto v = getEnv("IDSENTINEL_DATABASE__WAL_MODE"); !v.empty()) cfg.database.walMode = (toUpper(v) == "TRUE");
-    if (auto v = getEnv("IDSENTINEL_DATABASE__BUSY_TIMEOUT_MS"); !v.empty()) cfg.database.busyTimeoutMs = std::stoi(v);
+    if (auto v = getEnv("IDSENTINEL_DATABASE__BUSY_TIMEOUT_MS"); !v.empty()) {
+        try { cfg.database.busyTimeoutMs = std::stoi(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid busy_timeout_ms value: " + v }); }
+    }
 
-    if (auto v = getEnv("IDSENTINEL_POLICY__ORPHAN_SEVERITY"); !v.empty()) cfg.policy.orphanSeverity = parseSeverity(v);
-    if (auto v = getEnv("IDSENTINEL_POLICY__MISSING_SEVERITY"); !v.empty()) cfg.policy.missingSeverity = parseSeverity(v);
-    if (auto v = getEnv("IDSENTINEL_POLICY__DRIFT_SEVERITY"); !v.empty()) cfg.policy.driftSeverity = parseSeverity(v);
+    if (auto v = getEnv("IDSENTINEL_POLICY__ORPHAN_SEVERITY"); !v.empty()) {
+        auto r = parseSeverity(v);
+        if (r.hasError()) return Result<void>::err(r.error());
+        cfg.policy.orphanSeverity = r.value();
+    }
+    if (auto v = getEnv("IDSENTINEL_POLICY__MISSING_SEVERITY"); !v.empty()) {
+        auto r = parseSeverity(v);
+        if (r.hasError()) return Result<void>::err(r.error());
+        cfg.policy.missingSeverity = r.value();
+    }
+    if (auto v = getEnv("IDSENTINEL_POLICY__DRIFT_SEVERITY"); !v.empty()) {
+        auto r = parseSeverity(v);
+        if (r.hasError()) return Result<void>::err(r.error());
+        cfg.policy.driftSeverity = r.value();
+    }
 
-    if (auto v = getEnv("IDSENTINEL_SOURCE__MAX_FILE_AGE_HOURS"); !v.empty()) cfg.source.maxFileAgeHours = std::stoi(v);
+    if (auto v = getEnv("IDSENTINEL_SOURCE__MAX_FILE_AGE_HOURS"); !v.empty()) {
+        try { cfg.source.maxFileAgeHours = std::stoi(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid max_file_age_hours value: " + v }); }
+    }
 
-    if (auto v = getEnv("IDSENTINEL_LOGGING__LEVEL"); !v.empty()) cfg.logging.level = parseLogLevel(v);
-    if (auto v = getEnv("IDSENTINEL_LOGGING__FORMAT"); !v.empty()) cfg.logging.format = parseLogFormat(v);
+    if (auto v = getEnv("IDSENTINEL_LOGGING__LEVEL"); !v.empty()) {
+        auto r = parseLogLevel(v);
+        if (r.hasError()) return Result<void>::err(r.error());
+        cfg.logging.level = r.value();
+    }
+    if (auto v = getEnv("IDSENTINEL_LOGGING__FORMAT"); !v.empty()) {
+        auto r = parseLogFormat(v);
+        if (r.hasError()) return Result<void>::err(r.error());
+        cfg.logging.format = r.value();
+    }
     if (auto v = getEnv("IDSENTINEL_LOGGING__FILE"); !v.empty()) cfg.logging.file = expandPath(v);
-    if (auto v = getEnv("IDSENTINEL_LOGGING__MAX_FILE_SIZE_MB"); !v.empty()) cfg.logging.maxFileSizeMb = std::stoull(v);
-    if (auto v = getEnv("IDSENTINEL_LOGGING__MAX_FILES"); !v.empty()) cfg.logging.maxFiles = std::stoull(v);
+    if (auto v = getEnv("IDSENTINEL_LOGGING__MAX_FILE_SIZE_MB"); !v.empty()) {
+        try { cfg.logging.maxFileSizeMb = std::stoull(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid max_file_size_mb value: " + v }); }
+    }
+    if (auto v = getEnv("IDSENTINEL_LOGGING__MAX_FILES"); !v.empty()) {
+        try { cfg.logging.maxFiles = std::stoull(v); }
+        catch (...) { return Result<void>::err(Error{ "CONFIG", "Invalid max_files value: " + v }); }
+    }
     if (auto v = getEnv("IDSENTINEL_LOGGING__DAILY_ROTATION"); !v.empty()) cfg.logging.dailyRotation = (toUpper(v) == "TRUE");
 
     if (auto v = getEnv("IDSENTINEL_SECURITY__HMAC_KEY"); !v.empty()) cfg.security.hmacKey = v;
+    return Result<void>::ok();
 }
 
 Result<std::optional<toml::table>> parseConfigFile(const std::filesystem::path& path) {
@@ -141,7 +183,7 @@ std::filesystem::path findConfigFile(const std::optional<std::filesystem::path>&
     return {};
 }
 
-void parseConfig(const toml::table& tbl, Config& cfg) {
+Result<void> parseConfig(const toml::table& tbl, Config& cfg) {
     if (auto net = tbl["network"]; net && net.is_table()) {
         auto& netTbl = *net.as_table();
         cfg.network.hrFeedUrl = getValueOr(netTbl, "hr_feed_url", cfg.network.hrFeedUrl);
@@ -158,9 +200,21 @@ void parseConfig(const toml::table& tbl, Config& cfg) {
     }
     if (auto pol = tbl["policy"]; pol && pol.is_table()) {
         auto& polTbl = *pol.as_table();
-        if (auto s = polTbl["orphan_severity"]; s) cfg.policy.orphanSeverity = parseSeverity(s.value_or(""));
-        if (auto s = polTbl["missing_severity"]; s) cfg.policy.missingSeverity = parseSeverity(s.value_or(""));
-        if (auto s = polTbl["drift_severity"]; s) cfg.policy.driftSeverity = parseSeverity(s.value_or(""));
+        if (auto s = polTbl["orphan_severity"]; s) {
+            auto r = parseSeverity(s.value_or(""));
+            if (r.hasError()) return Result<void>::err(Error{ "CONFIG", r.error().message });
+            cfg.policy.orphanSeverity = r.value();
+        }
+        if (auto s = polTbl["missing_severity"]; s) {
+            auto r = parseSeverity(s.value_or(""));
+            if (r.hasError()) return Result<void>::err(Error{ "CONFIG", r.error().message });
+            cfg.policy.missingSeverity = r.value();
+        }
+        if (auto s = polTbl["drift_severity"]; s) {
+            auto r = parseSeverity(s.value_or(""));
+            if (r.hasError()) return Result<void>::err(Error{ "CONFIG", r.error().message });
+            cfg.policy.driftSeverity = r.value();
+        }
     }
     if (auto src = tbl["source"]; src && src.is_table()) {
         auto& srcTbl = *src.as_table();
@@ -168,10 +222,18 @@ void parseConfig(const toml::table& tbl, Config& cfg) {
     }
     if (auto log = tbl["logging"]; log && log.is_table()) {
         auto& logTbl = *log.as_table();
-        if (auto l = logTbl["level"]; l) cfg.logging.level = parseLogLevel(l.value_or(""));
-        if (auto f = logTbl["format"]; f) cfg.logging.format = parseLogFormat(f.value_or(""));
+        if (auto l = logTbl["level"]; l) {
+            auto r = parseLogLevel(l.value_or(""));
+            if (r.hasError()) return Result<void>::err(Error{ "CONFIG", r.error().message });
+            cfg.logging.level = r.value();
+        }
+        if (auto f = logTbl["format"]; f) {
+            auto r = parseLogFormat(f.value_or(""));
+            if (r.hasError()) return Result<void>::err(Error{ "CONFIG", r.error().message });
+            cfg.logging.format = r.value();
+        }
         if (auto f = logTbl["file"]; f) cfg.logging.file = expandPath(f.value_or(""));
-        
+
         // Parse nested rotation table
         if (auto rot = logTbl["rotation"]; rot && rot.is_table()) {
             auto& rotTbl = *rot.as_table();
@@ -196,6 +258,7 @@ void parseConfig(const toml::table& tbl, Config& cfg) {
         auto& secTbl = *sec.as_table();
         cfg.security.hmacKey = getValueOr(secTbl, "hmac_key", cfg.security.hmacKey);
     }
+    return Result<void>::ok();
 }
 
 Result<void> validateConfig(const Config& cfg) {
@@ -236,6 +299,10 @@ Result<Config> loadConfig(const std::optional<std::filesystem::path>& explicitPa
     Config cfg;
     auto configPath = findConfigFile(explicitPath);
 
+    if (explicitPath && configPath.empty()) {
+        return Result<Config>::err(Error{ "CONFIG", "Config file not found: " + explicitPath->string() });
+    }
+
     if (configPath.empty()) {
         SPDLOG_INFO("No config file found, using defaults with env overrides");
     } else {
@@ -244,10 +311,16 @@ Result<Config> loadConfig(const std::optional<std::filesystem::path>& explicitPa
         if (tblResult.hasError()) {
             return Result<Config>::err(tblResult.error());
         }
-        if (tblResult.value()) parseConfig(*tblResult.value(), cfg);
+        if (tblResult.value()) {
+            if (auto r = parseConfig(*tblResult.value(), cfg); r.hasError()) {
+                return Result<Config>::err(r.error());
+            }
+        }
     }
 
-    applyEnvOverrides(cfg);
+    if (auto r = applyEnvOverrides(cfg); r.hasError()) {
+        return Result<Config>::err(r.error());
+    }
     setDefaultPaths(cfg);
     if (auto r = validateConfig(cfg); r.hasError()) {
         return Result<Config>::err(r.error());

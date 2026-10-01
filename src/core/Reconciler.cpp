@@ -36,7 +36,7 @@ Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const s
         if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
         if (len == 32) {
-            std::copy_n(reinterpret_cast<const uint8_t*>(decoded.data()), 32, hmacKey_.begin());
+            std::copy_n(reinterpret_cast<const std::uint8_t*>(decoded.data()), 32, hmacKey_.begin());
             hasHmacKey_ = true;
             SPDLOG_INFO("HMAC-SHA256 enabled for integrity hashes");
         } else {
@@ -92,7 +92,7 @@ std::string Reconciler::sha256(std::string_view data) {
     return oss.str();
 }
 
-std::string Reconciler::hmacSha256(const uint8_t* key, size_t keyLen, std::string_view data) {
+std::string Reconciler::hmacSha256(const std::uint8_t* key, size_t keyLen, std::string_view data) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
     unsigned int len = 0;
 
@@ -115,6 +115,28 @@ std::string Reconciler::computeHash(std::string_view uid, ViolationType type, Se
         return hmacSha256(hmacKey_.data(), hmacKey_.size(), data);
     }
     return sha256(data);
+}
+
+std::string Reconciler::computeHashStatic(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey) {
+    std::string data = std::string(uid) + "|" + std::string(toString(type)) + "|" + std::string(toString(severity));
+    
+    if (!hmacKey.empty()) {
+        // Decode base64
+        std::string decoded;
+        decoded.resize(hmacKey.size());
+        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size());
+        if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
+        if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
+if (len == 32) {
+        return hmacSha256(reinterpret_cast<const std::uint8_t*>(decoded.data()), 32, data);
+    }
+    }
+    return sha256(data);
+}
+
+std::string Reconciler::verifyHash(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey) {
+    return computeHashStatic(uid, type, severity, hmacKey);
 }
 
 Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation(

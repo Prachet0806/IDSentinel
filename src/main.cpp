@@ -26,6 +26,8 @@ int main(int argc, char* argv[]) {
             return runConfig(opts);
         case CLIOptions::Command::Keygen:
             return runKeygen(opts);
+        case CLIOptions::Command::Verify:
+            return runVerify(opts);
     }
 
     return 1;

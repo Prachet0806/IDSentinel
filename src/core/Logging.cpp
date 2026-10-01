@@ -11,6 +11,51 @@
 #include <chrono>
 
 namespace {
+std::string formatTime(spdlog::log_clock::time_point tp) {
+    std::time_t t = spdlog::log_clock::to_time_t(tp);
+    std::tm localTm{};
+    std::tm utcTm{};
+#ifdef _WIN32
+    localtime_s(&localTm, &t);
+    gmtime_s(&utcTm, &t);
+#else
+    localtime_r(&t, &localTm);
+    gmtime_r(&t, &utcTm);
+#endif
+    
+    // Calculate UTC offset correctly, handling DST.
+    long offsetSec = 0;
+#ifdef _WIN32
+    // On Windows, use _get_timezone and _get_dstbias
+    long timezone = 0;
+    _get_timezone(&timezone);
+    long dstbias = 0;
+    _get_dstbias(&dstbias);
+    offsetSec = -timezone - dstbias;
+    // Check if DST is in effect for this time
+    if (localTm.tm_isdst > 0) {
+        offsetSec -= 3600; // DST adds an hour
+    }
+#else
+    // On POSIX, use tm_gmtoff if available (GNU extension)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    offsetSec = localTm.tm_gmtoff;
+#else
+    // Fallback: compute using mktime/gmtime (may have DST issues at boundaries)
+    offsetSec = static_cast<long>(std::difftime(std::mktime(&localTm), std::mktime(&utcTm)));
+#endif
+#endif
+    
+    char sign = offsetSec < 0 ? '-' : '+';
+    long absOff = offsetSec < 0 ? -offsetSec : offsetSec;
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &localTm);
+    long ms = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            tp.time_since_epoch()).count() % 1000);
+    return fmt::format("{}.{:03}{}{:02}{:02}", buf, ms, sign < 0 ? '-' : '+', absOff / 3600, (absOff % 3600) / 60);
+}
+
 // Pattern-based JSON sinks break the moment a message contains a quote,
 // backslash, or control character. This formatter serializes through a real
 // JSON library so every field is escaped correctly.
@@ -22,7 +67,17 @@ public:
         auto levelSv = spdlog::level::to_string_view(msg.level);
         j["level"] = std::string(levelSv.data(), levelSv.size());
         j["logger"] = std::string(msg.logger_name.begin(), msg.logger_name.end());
-        j["message"] = std::string(msg.payload.begin(), msg.payload.end());
+        // Handle potential non-UTF-8 in message payload
+        std::string message;
+        try {
+            message = std::string(msg.payload.begin(), msg.payload.end());
+            // Validate UTF-8 by attempting to parse as JSON
+            nlohmann::json::parse("\"" + message + "\"");
+        } catch (...) {
+            // Replace invalid UTF-8 sequences with replacement character
+            message = sanitizeUtf8(std::string(msg.payload.begin(), msg.payload.end()));
+        }
+        j["message"] = message;
         std::string out = j.dump();
         dest.append(out.data(), out.data() + out.size());
         dest.push_back('\n');
@@ -33,27 +88,63 @@ public:
     }
 
 private:
-    static std::string formatTime(spdlog::log_clock::time_point tp) {
-        std::time_t t = spdlog::log_clock::to_time_t(tp);
-        std::tm localTm{};
-        std::tm utcTm{};
-#ifdef _WIN32
-        localtime_s(&localTm, &t);
-        gmtime_s(&utcTm, &t);
-#else
-        localtime_r(&t, &localTm);
-        gmtime_r(&t, &utcTm);
-#endif
-        char buf[32];
-        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &localTm);
-        long ms = static_cast<long>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                tp.time_since_epoch()).count() % 1000);
-        // Portable UTC offset: how far local wall-clock is ahead of UTC.
-        long offsetSec = static_cast<long>(std::difftime(std::mktime(&localTm), std::mktime(&utcTm)));
-        char sign = offsetSec < 0 ? '-' : '+';
-        long absOff = offsetSec < 0 ? -offsetSec : offsetSec;
-        return fmt::format("{}.{:03}{}{:02}{:02}", buf, ms, sign, absOff / 3600, (absOff % 3600) / 60);
+    static std::string sanitizeUtf8(std::string input) {
+        std::string output;
+        output.reserve(input.size());
+        for (size_t i = 0; i < input.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(input[i]);
+            if (c < 0x80) {
+                // ASCII - copy as-is
+                output.push_back(input[i]);
+            } else if ((c & 0xE0) == 0xC0) {
+                // 2-byte sequence
+                if (i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80) {
+                    output.push_back(input[i]);
+                    output.push_back(input[i + 1]);
+                    ++i;
+                } else {
+                    output.push_back('\xEF');
+                    output.push_back('\xBF');
+                    output.push_back('\xBD'); // Replacement character
+                }
+            } else if ((c & 0xF0) == 0xE0) {
+                // 3-byte sequence
+                if (i + 2 < input.size() &&
+                    (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
+                    (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80) {
+                    output.push_back(input[i]);
+                    output.push_back(input[i + 1]);
+                    output.push_back(input[i + 2]);
+                    i += 2;
+                } else {
+                    output.push_back('\xEF');
+                    output.push_back('\xBF');
+                    output.push_back('\xBD');
+                }
+            } else if ((c & 0xF8) == 0xF0) {
+                // 4-byte sequence
+                if (i + 3 < input.size() &&
+                    (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
+                    (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80 &&
+                    (static_cast<unsigned char>(input[i + 3]) & 0xC0) == 0x80) {
+                    output.push_back(input[i]);
+                    output.push_back(input[i + 1]);
+                    output.push_back(input[i + 2]);
+                    output.push_back(input[i + 3]);
+                    i += 3;
+                } else {
+                    output.push_back('\xEF');
+                    output.push_back('\xBF');
+                    output.push_back('\xBD');
+                }
+            } else {
+                // Invalid leading byte
+                output.push_back('\xEF');
+                output.push_back('\xBF');
+                output.push_back('\xBD');
+            }
+        }
+        return output;
     }
 };
 

@@ -13,6 +13,13 @@ struct CSVParseResult {
     size_t validRows = 0;
     size_t malformedRows = 0;
     size_t duplicateRows = 0;
+    // Quarantined malformed rows for inspection
+    struct QuarantinedRow {
+        size_t rowNumber;
+        std::string rawLine;
+        std::string reason;
+    };
+    std::vector<QuarantinedRow> quarantinedRows;
 };
 
 class CSVParser {

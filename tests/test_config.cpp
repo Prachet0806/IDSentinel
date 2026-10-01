@@ -44,30 +44,30 @@ TEST_CASE("Config - default paths are platform-appropriate", "[config]") {
 
 TEST_CASE("Config - parseLogLevel", "[config]") {
     using namespace std::string_literals;
-    REQUIRE(parseLogLevel("trace") == LogLevel::Trace);
-    REQUIRE(parseLogLevel("DEBUG") == LogLevel::Debug);
-    REQUIRE(parseLogLevel("Info") == LogLevel::Info);
-    REQUIRE(parseLogLevel("WARN") == LogLevel::Warn);
-    REQUIRE(parseLogLevel("warning") == LogLevel::Warn);
-    REQUIRE(parseLogLevel("error") == LogLevel::Error);
-    REQUIRE(parseLogLevel("CRITICAL") == LogLevel::Critical);
-    REQUIRE(parseLogLevel("invalid") == LogLevel::Info);
+    REQUIRE(parseLogLevel("trace").value() == LogLevel::Trace);
+    REQUIRE(parseLogLevel("DEBUG").value() == LogLevel::Debug);
+    REQUIRE(parseLogLevel("Info").value() == LogLevel::Info);
+    REQUIRE(parseLogLevel("WARN").value() == LogLevel::Warn);
+    REQUIRE(parseLogLevel("warning").value() == LogLevel::Warn);
+    REQUIRE(parseLogLevel("error").value() == LogLevel::Error);
+    REQUIRE(parseLogLevel("CRITICAL").value() == LogLevel::Critical);
+    REQUIRE(parseLogLevel("invalid").hasError());
 }
 
 TEST_CASE("Config - parseLogFormat", "[config]") {
-    REQUIRE(parseLogFormat("json") == LogFormat::Json);
-    REQUIRE(parseLogFormat("JSON") == LogFormat::Json);
-    REQUIRE(parseLogFormat("text") == LogFormat::Text);
-    REQUIRE(parseLogFormat("TEXT") == LogFormat::Text);
-    REQUIRE(parseLogFormat("invalid") == LogFormat::Json);
+    REQUIRE(parseLogFormat("json").value() == LogFormat::Json);
+    REQUIRE(parseLogFormat("JSON").value() == LogFormat::Json);
+    REQUIRE(parseLogFormat("text").value() == LogFormat::Text);
+    REQUIRE(parseLogFormat("TEXT").value() == LogFormat::Text);
+    REQUIRE(parseLogFormat("invalid").hasError());
 }
 
 TEST_CASE("Config - parseSeverity", "[config]") {
-    REQUIRE(parseSeverity("critical") == Severity::Critical);
-    REQUIRE(parseSeverity("HIGH") == Severity::High);
-    REQUIRE(parseSeverity("Medium") == Severity::Medium);
-    REQUIRE(parseSeverity("low") == Severity::Low);
-    REQUIRE(parseSeverity("invalid") == Severity::Medium);
+    REQUIRE(parseSeverity("critical").value() == Severity::Critical);
+    REQUIRE(parseSeverity("HIGH").value() == Severity::High);
+    REQUIRE(parseSeverity("Medium").value() == Severity::Medium);
+    REQUIRE(parseSeverity("low").value() == Severity::Low);
+    REQUIRE(parseSeverity("invalid").hasError());
 }
 
 TEST_CASE("Config - nested rotation parsing", "[config]") {
@@ -319,7 +319,7 @@ orphan_severity = "LOW"
     std::filesystem::remove_all(tmpDir);
 }
 
-TEST_CASE("Config - invalid severity returns default", "[config]") {
+TEST_CASE("Config - invalid severity returns error", "[config]") {
     std::filesystem::path tmpDir = std::filesystem::temp_directory_path() / "idsentinel_test_severity";
     std::filesystem::create_directories(tmpDir);
     std::filesystem::path configPath = tmpDir / "config.toml";
@@ -335,9 +335,8 @@ orphan_severity = "INVALID"
     f.close();
 
     auto cfgResult = loadConfig(configPath);
-    REQUIRE(cfgResult.hasValue());
-    Config cfg = std::move(cfgResult.value());
-    REQUIRE(cfg.policy.orphanSeverity == Severity::Medium);
+    REQUIRE(cfgResult.hasError());
+    REQUIRE(cfgResult.error().code == "CONFIG");
 
     std::filesystem::remove_all(tmpDir);
 }
