@@ -16,14 +16,13 @@ jobs:
     # (GitHub rejects it at parse time), so paths here use `github.workspace`.
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         build_type: [Release, Debug]
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             vcpkg_triplet: x64-linux
           - os: windows-latest
             vcpkg_triplet: x64-windows
@@ -42,8 +41,25 @@ jobs:
           vcpkgArguments: 'install --feature-flags=manifests'
           appendedCacheArgs: '--binarysource=clear;files,${{ github.workspace }}/vcpkg-binary-cache,readwrite'
 
-      - name: Configure CMake
-        # bash everywhere: backslash continuations are not valid PowerShell.
+      - name: Configure CMake (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $toolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+          Write-Host "Toolchain=$toolchain"
+          cmake --version
+          if (-not (Test-Path -LiteralPath $toolchain)) {
+            throw "vcpkg toolchain not found: $toolchain"
+          }
+
+          cmake -S . -B build `
+            "-DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}" `
+            -DBUILD_TESTING=ON `
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+
+      - name: Configure CMake (Unix)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           cmake -S . -B build \
@@ -55,19 +71,53 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
-      - name: Run tests
-        # -C is required on multi-config generators (Visual Studio);
-        # harmless on single-config ones. bash for the nproc fallback chain.
-        shell: bash
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --parallel $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+      - name: Install static analysis tools
+        if: matrix.os == 'ubuntu-24.04' && matrix.build_type == 'Release'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-18 \
+            clang-tidy-18 \
+            clang-tools-18 \
+            cppcheck
+
+      - name: Verify static analysis tools
+        if: matrix.os == 'ubuntu-24.04' && matrix.build_type == 'Release'
+        run: |
+          clang-18 --version
+          clang-tidy-18 --version
+          command -v run-clang-tidy-18 || command -v run-clang-tidy || ls /usr/lib/llvm-18/share/clang/run-clang-tidy.py
+          cppcheck --version
 
       - name: Run clang-tidy
-        if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'
+        if: matrix.os == 'ubuntu-24.04' && matrix.build_type == 'Release'
         run: |
-          pip install clang-tidy-review
-          run-clang-tidy-18 -p build -checks='bugprone-*,performance-*,modernize-use-nullptr,modernize-use-emplace,modernize-use-equals-default,modernize-use-equals-delete,modernize-use-override,readability-identifier-naming,readability-magic-numbers,readability-function-cognitive-complexity,readability-container-size-empty' -header-filter='.*' -quiet
+          TIDY_RUNNER="$(command -v run-clang-tidy-18 || command -v run-clang-tidy || echo /usr/lib/llvm-18/share/clang/run-clang-tidy.py)"
+          echo "Using tidy runner: $TIDY_RUNNER"
+          test -f build/compile_commands.json
+          "$TIDY_RUNNER" -p build -j "$(nproc)" -header-filter='src/.*' -quiet --warnings-as-errors='*'
 
       - name: Run cppcheck
-        if: matrix.os == 'ubuntu-latest' && matrix.build_type == 'Release'
+        if: matrix.os == 'ubuntu-24.04' && matrix.build_type == 'Release'
         run: |
           cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/
+
+      - name: Run tests (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          ctest `
+            --test-dir build `
+            -C "${{ matrix.build_type }}" `
+            --output-on-failure `
+            --parallel 4
+
+      - name: Run tests (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          ctest \
+            --test-dir build \
+            -C "${{ matrix.build_type }}" \
+            --output-on-failure \
+            --parallel 4

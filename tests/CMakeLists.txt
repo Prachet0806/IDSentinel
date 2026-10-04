@@ -1,10 +1,7 @@
-cmake_minimum_required(VERSION 3.25)
-project(IDSentinelTests LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
+# NOTE: No cmake_minimum_required/project() here: this file is included via
+# add_subdirectory() and inherits the top-level project, CXX standard, and
+# policies. A nested project() call resets directory scope and breaks the
+# Visual Studio multi-config generator.
 find_package(Catch2 CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tomlplusplus CONFIG REQUIRED)

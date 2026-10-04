@@ -48,6 +48,7 @@ private:
     Severity driftSeverity_ = Severity::High;
 
     std::string generateRunID();
+    static std::string generateFallbackRunID();
     std::string computeHash(std::string_view uid, ViolationType type, Severity severity);
     static std::string computeHashStatic(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey);
     static std::string hmacSha256(const std::uint8_t* key, size_t keyLen, std::string_view data);

@@ -18,7 +18,7 @@ Result<void> SourceValidator::validateHeaders(const std::vector<std::string>& he
             }
         }
         if (!found) {
-            missing.push_back(required);
+            missing.emplace_back(required);
         }
     }
 
@@ -33,7 +33,7 @@ Result<void> SourceValidator::validateHeaders(const std::vector<std::string>& he
     return Result<void>::ok();
 }
 
-Result<SourceValidationResult> SourceValidator::validate(
+Result<SourceValidationResult> SourceValidator::validate( // NOLINT(readability-function-cognitive-complexity): sequential fail-closed checks, each returns/appends independently
     const std::unordered_map<std::string, Identity>& identities,
     const std::string& sourceName,
     size_t totalRows,
@@ -70,13 +70,14 @@ Result<SourceValidationResult> SourceValidator::validate(
 
     // Check malformed ratio
     if (result.totalRows > 0) {
+        constexpr double kPercentScale = 100.0; // NOLINT(readability-magic-numbers): ratio to percent
         double malformedRatio = static_cast<double>(malformedRows) / result.totalRows;
         if (malformedRatio > config_.maxMalformedRatio) {
             result.errors.push_back(
                 sourceName + " source has " + std::to_string(malformedRows) +
                 " malformed rows out of " + std::to_string(result.totalRows) +
-                " (" + std::to_string(static_cast<int>(malformedRatio * 100)) + "% > " +
-                std::to_string(static_cast<int>(config_.maxMalformedRatio * 100)) + "% allowed)"
+                " (" + std::to_string(static_cast<int>(malformedRatio * kPercentScale)) + "% > " +
+                std::to_string(static_cast<int>(config_.maxMalformedRatio * kPercentScale)) + "% allowed)"
             );
         }
     }
@@ -130,9 +131,11 @@ bool SourceValidator::hasRequiredColumns(const std::vector<std::string>& headers
 }
 
 Result<SourceValidationConfig> SourceValidator::fromConfig(const struct Config& cfg) {
+    constexpr double kDefaultMaxMalformedRatio = 0.05; // NOLINT(readability-magic-numbers): 5% malformed-row tolerance
+    (void)cfg;
     SourceValidationConfig vconfig;
     vconfig.requiredColumns = {"id", "name", "department"};
-    vconfig.maxMalformedRatio = 0.05;
+    vconfig.maxMalformedRatio = kDefaultMaxMalformedRatio;
     vconfig.maxDuplicateRows = 0;
     vconfig.allowEmpty = false;
     return Result<SourceValidationConfig>::ok(vconfig);

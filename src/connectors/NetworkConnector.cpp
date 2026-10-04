@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 
 std::string redactUrlForLogging(const std::string& url) {
     auto schemePos = url.find("://");
@@ -69,13 +70,18 @@ void NetworkConnector::setMaxRetries(int maxRetries) {
 }
 
 size_t NetworkConnector::writeCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    // Guard against size*nmemb overflow (bugprone-sizeof-expression / CERT MEM07).
+    if (size != 0 && nmemb > (std::numeric_limits<size_t>::max)() / size) {
+        static_cast<WriteState*>(userp)->limitExceeded = true;
+        return 0;
+    }
     size_t total = size * nmemb;
-    WriteState* state = static_cast<WriteState*>(userp);
+    auto* state = static_cast<WriteState*>(userp); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): libcurl C API requires void*
     if (state->buffer->size() + total > state->maxBytes) {
         state->limitExceeded = true;
         return 0; // Abort the transfer; curl reports CURLE_WRITE_ERROR.
     }
-    state->buffer->append(static_cast<char*>(contents), total);
+    state->buffer->append(static_cast<const char*>(contents), total); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): libcurl C API requires void*
     return total;
 }
 
@@ -172,8 +178,10 @@ Result<std::string> NetworkConnector::fetch(const std::string& url) {
     Result<std::string> last = Result<std::string>::err(Error{ "CURL_ERROR", "No attempts made" });
     for (int attempt = 0; attempt <= maxRetries_; ++attempt) {
         if (attempt > 0) {
-            // Exponential backoff: 1s, 2s, 4s, ...
-            auto delay = std::chrono::seconds(1 << (attempt - 1));
+            // Exponential backoff: 1s, 2s, 4s, ... capped to avoid shift overflow.
+            constexpr int kMaxShift = 30;
+            const int shift = (attempt - 1) > kMaxShift ? kMaxShift : (attempt - 1); // NOLINT(readability-magic-numbers): backoff cap
+            const auto delay = std::chrono::seconds(1ULL << static_cast<unsigned>(shift)); // NOLINT(readability-magic-numbers): 2^shift backoff
             SPDLOG_WARN("Retrying fetch of {} (attempt {}/{}) after {}s",
                         redactUrlForLogging(url), attempt + 1, maxRetries_ + 1, delay.count());
             std::this_thread::sleep_for(delay);

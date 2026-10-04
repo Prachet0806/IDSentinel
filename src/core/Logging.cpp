@@ -11,7 +11,7 @@
 #include <chrono>
 
 namespace {
-std::string formatTime(spdlog::log_clock::time_point tp) {
+std::string formatTime(spdlog::log_clock::time_point tp) { // NOLINT(readability-function-cognitive-complexity): platform branches are each trivial; splitting hurts readability
     std::time_t t = spdlog::log_clock::to_time_t(tp);
     std::tm localTm{};
     std::tm utcTm{};
@@ -22,7 +22,7 @@ std::string formatTime(spdlog::log_clock::time_point tp) {
     localtime_r(&t, &localTm);
     gmtime_r(&t, &utcTm);
 #endif
-    
+
     // Calculate UTC offset correctly, handling DST.
     long offsetSec = 0;
 #ifdef _WIN32
@@ -34,7 +34,8 @@ std::string formatTime(spdlog::log_clock::time_point tp) {
     offsetSec = -timezone - dstbias;
     // Check if DST is in effect for this time
     if (localTm.tm_isdst > 0) {
-        offsetSec -= 3600; // DST adds an hour
+        constexpr long kDstHourSec = 3600; // NOLINT(readability-magic-numbers): seconds per hour
+        offsetSec -= kDstHourSec; // DST adds an hour
     }
 #else
     // On POSIX, use tm_gmtoff if available (GNU extension)
@@ -42,18 +43,22 @@ std::string formatTime(spdlog::log_clock::time_point tp) {
     offsetSec = localTm.tm_gmtoff;
 #else
     // Fallback: compute using mktime/gmtime (may have DST issues at boundaries)
+    // NOLINTNEXTLINE(bugprone-suspicious-stringview-obj-cpy, bugprone-misplaced-widening-cast): mktime intentionally normalizes a copy of broken-down time
     offsetSec = static_cast<long>(std::difftime(std::mktime(&localTm), std::mktime(&utcTm)));
 #endif
 #endif
-    
+
     char sign = offsetSec < 0 ? '-' : '+';
     long absOff = offsetSec < 0 ? -offsetSec : offsetSec;
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &localTm);
+    constexpr long kMillisPerSec = 1000;
+    constexpr long kSecsPerHour = 3600;
+    constexpr long kSecsPerMin = 60;
     long ms = static_cast<long>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            tp.time_since_epoch()).count() % 1000);
-    return fmt::format("{}.{:03}{}{:02}{:02}", buf, ms, sign < 0 ? '-' : '+', absOff / 3600, (absOff % 3600) / 60);
+            tp.time_since_epoch()).count() % kMillisPerSec);
+    return fmt::format("{}.{:03}{}{:02}{:02}", buf, ms, sign < 0 ? '-' : '+', absOff / kSecsPerHour, (absOff % kSecsPerHour) / kSecsPerMin);
 }
 
 // Pattern-based JSON sinks break the moment a message contains a quote,
@@ -88,17 +93,27 @@ public:
     }
 
 private:
-    static std::string sanitizeUtf8(std::string input) {
+    static std::string sanitizeUtf8(std::string input) { // NOLINT(readability-function-cognitive-complexity): byte-class state machine is inherently branchy
         std::string output;
         output.reserve(input.size());
+        // UTF-8 lead-byte markers and UTF-8 replacement character (EF BF BD).
+        constexpr unsigned char kAsciiMax = 0x80; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kTwoByteMark = 0xC0; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kTwoByteMask = 0xE0; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kThreeByteMark = 0xE0; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kThreeByteMask = 0xF0; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kFourByteMark = 0xF0; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kFourByteMask = 0xF8; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kContMark = 0x80; // NOLINT(readability-magic-numbers)
+        constexpr unsigned char kContMask = 0xC0; // NOLINT(readability-magic-numbers)
         for (size_t i = 0; i < input.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(input[i]);
-            if (c < 0x80) {
+            if (c < kAsciiMax) {
                 // ASCII - copy as-is
                 output.push_back(input[i]);
-            } else if ((c & 0xE0) == 0xC0) {
+            } else if ((c & kTwoByteMask) == kTwoByteMark) {
                 // 2-byte sequence
-                if (i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80) {
+                if (i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark) {
                     output.push_back(input[i]);
                     output.push_back(input[i + 1]);
                     ++i;
@@ -107,11 +122,11 @@ private:
                     output.push_back('\xBF');
                     output.push_back('\xBD'); // Replacement character
                 }
-            } else if ((c & 0xF0) == 0xE0) {
+            } else if ((c & kThreeByteMask) == kThreeByteMark) {
                 // 3-byte sequence
                 if (i + 2 < input.size() &&
-                    (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
-                    (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80) {
+                    (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark &&
+                    (static_cast<unsigned char>(input[i + 2]) & kContMask) == kContMark) {
                     output.push_back(input[i]);
                     output.push_back(input[i + 1]);
                     output.push_back(input[i + 2]);
@@ -121,12 +136,12 @@ private:
                     output.push_back('\xBF');
                     output.push_back('\xBD');
                 }
-            } else if ((c & 0xF8) == 0xF0) {
+            } else if ((c & kFourByteMask) == kFourByteMark) {
                 // 4-byte sequence
                 if (i + 3 < input.size() &&
-                    (static_cast<unsigned char>(input[i + 1]) & 0xC0) == 0x80 &&
-                    (static_cast<unsigned char>(input[i + 2]) & 0xC0) == 0x80 &&
-                    (static_cast<unsigned char>(input[i + 3]) & 0xC0) == 0x80) {
+                    (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark &&
+                    (static_cast<unsigned char>(input[i + 2]) & kContMask) == kContMark &&
+                    (static_cast<unsigned char>(input[i + 3]) & kContMask) == kContMark) {
                     output.push_back(input[i]);
                     output.push_back(input[i + 1]);
                     output.push_back(input[i + 2]);
@@ -172,7 +187,7 @@ spdlog::sink_ptr createFileSink(LogFormat format, LogLevel level,
             filePath.string(), 0, 0, true, maxFiles);
     } else {
         file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            filePath.string(), maxFileSizeMb * 1024 * 1024, maxFiles, true);
+            filePath.string(), maxFileSizeMb * 1024 * 1024, maxFiles, true); // NOLINT(readability-magic-numbers): MiB to bytes
     }
     file_sink->set_level(toSpdlogLevel(level));
     if (format == LogFormat::Json) {

@@ -10,10 +10,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- 2. Compiler Warnings ---
+# NOTE: Do not pass /std:c++... manually; CMAKE_CXX_STANDARD already emits it.
+# Manually adding /std:c++latest fights the generated flag (D9025) on MSVC.
 if(MSVC)
-    add_compile_options(/W4 /permissive- /std:c++latest)
+    add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -Wconversion -Wsign-conversion -Wnull-dereference -Wdouble-promotion -Wformat=2)
+    add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -Wsign-conversion -Wnull-dereference -Wdouble-promotion -Wformat=2)
 endif()
 
 # --- 3. Dependencies (vcpkg) ---
@@ -67,8 +69,13 @@ add_executable(IDSentinel src/main.cpp)
 target_link_libraries(IDSentinel PRIVATE IDSentinelLib)
 
 # --- 7. Output Management ---
+# NOTE: Visual Studio (multi-config) appends $(Configuration) automatically,
+# so binaries land in build/bin/Release, build/bin/Debug, etc. Single-config
+# generators (Make/Ninja) use build/bin directly. Consume via ctest -C.
 set_target_properties(IDSentinel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin/Debug"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin/Release"
 )
 
 # --- 8. Testing ---

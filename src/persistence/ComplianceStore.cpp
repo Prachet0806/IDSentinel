@@ -436,7 +436,7 @@ Result<std::vector<FindingView>> ComplianceStore::queryFindings(
             return Result<std::vector<FindingView>>::err(Error{ "DATA_CORRUPT", e.what() });
         }
         f.integrityHash = columnText(stmt, 7);
-        findings.push_back(std::move(f));
+        findings.emplace_back(std::move(f));
     }
     cleanup();
     if (rc != SQLITE_DONE) {

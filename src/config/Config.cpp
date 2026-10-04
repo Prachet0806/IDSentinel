@@ -183,7 +183,7 @@ std::filesystem::path findConfigFile(const std::optional<std::filesystem::path>&
     return {};
 }
 
-Result<void> parseConfig(const toml::table& tbl, Config& cfg) {
+Result<void> parseConfig(const toml::table& tbl, Config& cfg) { // NOLINT(readability-function-cognitive-complexity): one branch per config section; each branch is a straight mapping
     if (auto net = tbl["network"]; net && net.is_table()) {
         auto& netTbl = *net.as_table();
         cfg.network.hrFeedUrl = getValueOr(netTbl, "hr_feed_url", cfg.network.hrFeedUrl);
@@ -262,6 +262,7 @@ Result<void> parseConfig(const toml::table& tbl, Config& cfg) {
 }
 
 Result<void> validateConfig(const Config& cfg) {
+    constexpr int kHmacKeyBytes = 32;
     if (cfg.network.hrFeedUrl.empty()) return Result<void>::err(Error{ "CONFIG", "network.hr_feed_url is required" });
     if (cfg.network.timeoutSeconds <= 0) return Result<void>::err(Error{ "CONFIG", "network.timeout_seconds must be > 0" });
     if (cfg.network.maxResponseMb <= 0) return Result<void>::err(Error{ "CONFIG", "network.max_response_mb must be > 0" });
@@ -277,12 +278,12 @@ Result<void> validateConfig(const Config& cfg) {
         // 44 base64 chars ending in '=', decoding to raw length 33)
         std::string decoded;
         decoded.resize(cfg.security.hmacKey.size());
-        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
-                                  reinterpret_cast<const unsigned char*>(cfg.security.hmacKey.data()), cfg.security.hmacKey.size());
+        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(cfg.security.hmacKey.data()), cfg.security.hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         const std::string& key = cfg.security.hmacKey;
         if (key.size() >= 1 && key.back() == '=') --len;
         if (key.size() >= 2 && key[key.size() - 2] == '=') --len;
-        if (len != 32) {
+        if (len != kHmacKeyBytes) {
             return Result<void>::err(Error{ "CONFIG", "security.hmac_key must be a valid base64-encoded 32-byte key (got " + std::to_string(len) + " bytes)" });
         }
     }

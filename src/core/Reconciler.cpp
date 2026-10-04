@@ -14,6 +14,7 @@
 
 Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const struct PolicyConfig* policy)
     : store_(store) {
+    constexpr int kHmacKeyBytes = 32;
     if (policy) {
         orphanSeverity_ = policy->orphanSeverity;
         missingSeverity_ = policy->missingSeverity;
@@ -31,12 +32,12 @@ Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const s
         // Decode base64 (EVP_DecodeBlock does not discount '=' padding)
         std::string decoded;
         decoded.resize(hmacKey.size());
-        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
-                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size());
+        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
-        if (len == 32) {
-            std::copy_n(reinterpret_cast<const std::uint8_t*>(decoded.data()), 32, hmacKey_.begin());
+        if (len == kHmacKeyBytes) {
+            std::copy_n(reinterpret_cast<const std::uint8_t*>(decoded.data()), kHmacKeyBytes, hmacKey_.begin()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL byte buffer to uint8_t key
             hasHmacKey_ = true;
             SPDLOG_INFO("HMAC-SHA256 enabled for integrity hashes");
         } else {
@@ -58,10 +59,11 @@ std::string Reconciler::generateRunID() {
         auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
         auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 
+        constexpr uint64_t kLowMask = 0xFFFFFFFFu; // NOLINT(readability-magic-numbers): low 32 bits of timestamp
         std::seed_seq seed{
             rd(), rd(), rd(), rd(),
-            static_cast<unsigned>(nanos & 0xFFFFFFFFu),
-            static_cast<unsigned>(nanos >> 32),
+            static_cast<unsigned>(nanos & static_cast<decltype(nanos)>(kLowMask)),
+            static_cast<unsigned>(nanos >> 32), // NOLINT(readability-magic-numbers): high 32 bits
             static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
         };
 
@@ -71,13 +73,19 @@ std::string Reconciler::generateRunID() {
         std::ostringstream oss;
         oss << "RUN_" << std::hex << nanos << "_" << dist(rng);
         return oss.str();
+    } catch (const std::exception&) {
+        return generateFallbackRunID();
     } catch (...) {
-        auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
-        auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-        std::ostringstream oss;
-        oss << "RUN_" << std::hex << nanos << "_fallback";
-        return oss.str();
+        return generateFallbackRunID();
     }
+}
+
+std::string Reconciler::generateFallbackRunID() {
+    const auto now = std::chrono::high_resolution_clock::now().time_since_epoch();
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    std::ostringstream oss;
+    oss << "RUN_" << std::hex << nanos << "_fallback";
+    return oss.str();
 }
 
 std::string Reconciler::sha256(std::string_view data) {
@@ -118,18 +126,19 @@ std::string Reconciler::computeHash(std::string_view uid, ViolationType type, Se
 }
 
 std::string Reconciler::computeHashStatic(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey) {
+    constexpr int kHmacKeyBytes = 32;
     std::string data = std::string(uid) + "|" + std::string(toString(type)) + "|" + std::string(toString(severity));
-    
+
     if (!hmacKey.empty()) {
         // Decode base64
         std::string decoded;
         decoded.resize(hmacKey.size());
-        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
-                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size());
+        int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
-if (len == 32) {
-        return hmacSha256(reinterpret_cast<const std::uint8_t*>(decoded.data()), 32, data);
+if (len == kHmacKeyBytes) {
+        return hmacSha256(reinterpret_cast<const std::uint8_t*>(decoded.data()), kHmacKeyBytes, data); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL byte buffer to uint8_t key
     }
     }
     return sha256(data);
@@ -139,7 +148,7 @@ std::string Reconciler::verifyHash(std::string_view uid, ViolationType type, Sev
     return computeHashStatic(uid, type, severity, hmacKey);
 }
 
-Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation(
+Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLINT(readability-function-cognitive-complexity): orchestration intentionally linear; helpers below keep each phase testable
     const std::unordered_map<std::string, Identity>& hrSource,
     const std::unordered_map<std::string, Identity>& targetSystem,
     RunMode mode
@@ -187,12 +196,12 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation(
     // sort IDs first. Finding IDs (AUTOINCREMENT) are then stable run to run.
     std::vector<std::string> sortedTarget;
     sortedTarget.reserve(targetSystem.size());
-    for (const auto& [id, _] : targetSystem) sortedTarget.push_back(id);
+    for (const auto& [id, _] : targetSystem) sortedTarget.emplace_back(id);
     std::sort(sortedTarget.begin(), sortedTarget.end());
 
     std::vector<std::string> sortedHr;
     sortedHr.reserve(hrSource.size());
-    for (const auto& [id, _] : hrSource) sortedHr.push_back(id);
+    for (const auto& [id, _] : hrSource) sortedHr.emplace_back(id);
     std::sort(sortedHr.begin(), sortedHr.end());
 
     auto emitViolation = [&](const std::string& id, ViolationType type, Severity severity,

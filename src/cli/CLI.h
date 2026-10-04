@@ -13,13 +13,13 @@ struct CLIOptions {
     bool allowLocalFallback = false;
     std::string runId;
     std::string inspectFormat = "table";
-    int inspectLimit = 100;
+    int inspectLimit = 100; // NOLINT(readability-magic-numbers): default page size
     int inspectOffset = 0;
-    int keyBits = 256;
+    int keyBits = 256; // NOLINT(readability-magic-numbers): HMAC-SHA256 default key size
     std::string keyFormat = "base64";
     bool validateOnly = false;
     std::string verifyRunId;
-    std::string verifyHmacKey;
+    std::optional<std::string> verifyHmacKey;
 };
 
 Result<CLIOptions> parseCLI(int argc, char* argv[]);

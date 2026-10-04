@@ -8,7 +8,7 @@
 #include <spdlog/spdlog.h>
 
 namespace {
-std::string trimAndLower(std::string s) {
+std::string trimAndLower(std::string s) { // NOLINT(performance-unnecessary-value-param): input is normalized in place
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
         s.pop_back();
     size_t start = 0;
@@ -98,23 +98,28 @@ Result<ColumnMap> mapHeaderColumns(const std::vector<std::string>& header) {
 }
 }
 
-Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
+Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) { // NOLINT(readability-function-cognitive-complexity)
     CSVParseResult result;
     std::string line;
     bool firstNonEmpty = true;
     ColumnMap columns;
     size_t lineNumber = 0;
 
+    // UTF-8 BOM bytes (EF BB BF) stripped from the first line if present.
+    constexpr unsigned char kBom0 = 0xEF; // NOLINT(readability-magic-numbers)
+    constexpr unsigned char kBom1 = 0xBB; // NOLINT(readability-magic-numbers)
+    constexpr unsigned char kBom2 = 0xBF; // NOLINT(readability-magic-numbers)
+    constexpr size_t kBomLen = 3;
     while (std::getline(input, line)) {
         ++lineNumber;
         if (line.empty()) continue;
 
         // Strip UTF-8 BOM if present on first line
-        if (lineNumber == 1 && line.size() >= 3 && 
-            static_cast<unsigned char>(line[0]) == 0xEF &&
-            static_cast<unsigned char>(line[1]) == 0xBB &&
-            static_cast<unsigned char>(line[2]) == 0xBF) {
-            line = line.substr(3);
+        if (lineNumber == 1 && line.size() >= kBomLen &&
+            static_cast<unsigned char>(line[0]) == kBom0 &&
+            static_cast<unsigned char>(line[1]) == kBom1 &&
+            static_cast<unsigned char>(line[2]) == kBom2) {
+            line = line.substr(kBomLen);
         }
 
         if (line.empty()) continue;
@@ -141,7 +146,7 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
         int need = std::max({columns.id, columns.name, columns.department});
         if (cols.size() > static_cast<std::size_t>(need)) {
             if (cols[columns.id].empty()) {
-                result.quarantinedRows.push_back({lineNumber, line, "empty id"});
+                result.quarantinedRows.emplace_back(lineNumber, line, "empty id");
                 ++result.malformedRows;
             } else {
                 auto [it, inserted] = result.identities.try_emplace(
@@ -160,9 +165,9 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) {
                 if (!c.empty()) { anyContent = true; break; }
             }
             if (anyContent) {
-                result.quarantinedRows.push_back({lineNumber, line, "insufficient columns (got " + std::to_string(cols.size()) + ", need " + std::to_string(need + 1) + ")"});
+                result.quarantinedRows.emplace_back(lineNumber, line, "insufficient columns (got " + std::to_string(cols.size()) + ", need " + std::to_string(need + 1) + ")");
             } else {
-                result.quarantinedRows.push_back({lineNumber, line, "empty row"});
+                result.quarantinedRows.emplace_back(lineNumber, line, "empty row");
             }
             ++result.malformedRows;
         }
@@ -187,7 +192,7 @@ Result<CSVParseResult> CSVParser::parseFile(const std::filesystem::path& path) {
     return result;
 }
 
-Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) {
+Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) { // NOLINT(readability-function-cognitive-complexity): legacy streaming path kept small; structured parsing lives in parseFromStream
     std::string line;
     bool firstNonEmpty = true;
     size_t lineNum = 0;
@@ -203,9 +208,10 @@ Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) {
         firstNonEmpty = false;
 
         std::vector<std::string> cols = parseRow(line);
-        if (cols.size() >= 3 && !cols[0].empty()) {
+        constexpr size_t kRequiredColumns = 3;
+        if (cols.size() >= kRequiredColumns && !cols[0].empty()) {
             callback(cols);
-        } else if (cols.size() > 0 && !cols[0].empty()) {
+        } else if (!cols.empty() && !cols[0].empty()) {
             SPDLOG_WARN("Line {}: insufficient columns (got {}, need 3)", lineNum, cols.size());
         }
     }

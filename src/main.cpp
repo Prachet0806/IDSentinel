@@ -2,6 +2,7 @@
 #include "core/Logging.h"
 #include "connectors/NetworkConnector.h"
 #include <spdlog/spdlog.h>
+#include <iostream>
 
 int main(int argc, char* argv[]) {
     // Process-scoped libcurl state: must outlive every NetworkConnector.
@@ -12,11 +13,15 @@ int main(int argc, char* argv[]) {
 
     auto optsResult = parseCLI(argc, argv);
     if (optsResult.hasError()) {
+        std::cerr << "CLI parsing error: " << optsResult.error().message << "\n";
         return 1;
     }
 
     CLIOptions opts = std::move(optsResult.value());
 
+    std::cerr << "[DEBUG] main: opts.command=" << static_cast<int>(opts.command) 
+              << ", verifyRunId=" << opts.verifyRunId 
+              << ", verifyHmacKey.has_value=" << opts.verifyHmacKey.has_value() << "\n";
     switch (opts.command) {
         case CLIOptions::Command::Reconcile:
             return runReconcile(opts);

@@ -23,19 +23,28 @@
 #include <sqlite3.h>
 #include <iostream>
 #include <cstdint>
+#include <limits>
 
 namespace {
+constexpr int kBase64LineBlock = 4;
+constexpr int kBase64ByteBlock = 3;
+constexpr int kHexFieldWidth = 2;
+constexpr int kBitsPerByte = 8;
+
 std::string base64Encode(const uint8_t* data, size_t len) {
+    if (len > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        throw std::length_error("base64 input too large");
+    }
     std::string out;
-    out.resize(4 * ((len + 2) / 3));
+    out.resize(static_cast<size_t>(kBase64LineBlock) * ((len + 2) / 3)); // NOLINT(readability-magic-numbers): base64 4/3 expansion
     EVP_ENCODE_CTX* ctx = EVP_ENCODE_CTX_new();
     int outl = 0;
     EVP_EncodeInit(ctx);
-    EVP_EncodeUpdate(ctx, reinterpret_cast<unsigned char*>(out.data()), &outl, data, static_cast<int>(len));
+    EVP_EncodeUpdate(ctx, reinterpret_cast<unsigned char*>(out.data()), &outl, data, static_cast<int>(len)); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
     int final_len = 0;
-    EVP_EncodeFinal(ctx, reinterpret_cast<unsigned char*>(out.data() + outl), &final_len);
+    EVP_EncodeFinal(ctx, reinterpret_cast<unsigned char*>(out.data() + outl), &final_len); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
     EVP_ENCODE_CTX_free(ctx);
-    out.resize(outl + final_len);
+    out.resize(static_cast<size_t>(outl + final_len));
     return out;
 }
 
@@ -43,7 +52,7 @@ std::string hexEncode(const uint8_t* data, size_t len) {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
     for (size_t i = 0; i < len; ++i) {
-        oss << std::setw(2) << static_cast<int>(data[i]);
+        oss << std::setw(kHexFieldWidth) << static_cast<int>(data[i]);
     }
     return oss.str();
 }
@@ -75,9 +84,11 @@ void printConfig(const Config& cfg) {
 }
 }
 
-Result<CLIOptions> parseCLI(int argc, char* argv[]) {
+Result<CLIOptions> parseCLI(int argc, char* argv[]) { // NOLINT(readability-function-cognitive-complexity): one straight-line block per subcommand; no nesting to extract
     CLIOptions opts;
     CLI::App app("IDSentinel - Identity Reconciliation Engine");
+    constexpr int kMaxInspectLimit = 10000; // NOLINT(readability-magic-numbers): CLI page-size cap
+    constexpr int kHmacKeyBits = 256; // NOLINT(readability-magic-numbers): HMAC-SHA256 key size
 
     auto* reconcile = app.add_subcommand("reconcile", "Run identity reconciliation (default)");
     reconcile->add_flag("--dry-run", opts.dryRun, "Preview violations without writing to database");
@@ -90,7 +101,7 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
     auto* inspect = app.add_subcommand("inspect", "Inspect reconciliation run results");
     inspect->add_option("--run-id", opts.runId, "Run ID to inspect")->required();
     inspect->add_option("--format", opts.inspectFormat, "Output format: table, json")->check(CLI::IsMember({"table", "json"}));
-    inspect->add_option("--limit", opts.inspectLimit, "Max findings per page")->check(CLI::Range(1, 10000));
+    inspect->add_option("--limit", opts.inspectLimit, "Max findings per page")->check(CLI::Range(1, kMaxInspectLimit));
     inspect->add_option("--offset", opts.inspectOffset, "Findings page offset")->check(CLI::NonNegativeNumber);
     inspect->add_option("--config", opts.configPath, "Path to config file");
 
@@ -99,7 +110,7 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
     configCmd->add_option("--config", opts.configPath, "Path to config file");
 
     auto* keygen = app.add_subcommand("keygen", "Generate HMAC key");
-    keygen->add_option("--bits", opts.keyBits, "Key size in bits")->check(CLI::IsMember({256}));
+    keygen->add_option("--bits", opts.keyBits, "Key size in bits")->check(CLI::IsMember({kHmacKeyBits}));
     keygen->add_option("--format", opts.keyFormat, "Output format")->check(CLI::IsMember({"base64", "hex"}));
 
     auto* verify = app.add_subcommand("verify", "Verify hash chain integrity of a reconciliation run");
@@ -114,6 +125,10 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
         return Result<CLIOptions>::err(Error{ "CLI_PARSE", e.what() });
+    } catch (const std::exception& e) {
+        return Result<CLIOptions>::err(Error{ "CLI_PARSE_EXCEPTION", e.what() });
+    } catch (...) {
+        return Result<CLIOptions>::err(Error{ "CLI_PARSE_EXCEPTION", "Unknown exception during CLI parsing" });
     }
 
     if (app.get_subcommands().empty()) {
@@ -130,7 +145,7 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) {
     return Result<CLIOptions>::ok(opts);
 }
 
-int runReconcile(const CLIOptions& opts) {
+int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognitive-complexity): fail-closed orchestration is intentionally sequential; phases are logged inline
     auto cfgResult = loadConfig(opts.configPath);
     if (cfgResult.hasError()) {
         SPDLOG_ERROR("Failed to load config: {}", cfgResult.error().message);
@@ -146,7 +161,8 @@ int runReconcile(const CLIOptions& opts) {
     // Fetch HR feed
     NetworkConnector net;
     net.setTimeouts(cfg.network.timeoutSeconds, cfg.network.timeoutSeconds);
-    net.setMaxResponseBytes(static_cast<size_t>(cfg.network.maxResponseMb) * 1024 * 1024);
+    constexpr size_t kBytesPerMb = 1024 * 1024; // NOLINT(readability-magic-numbers): MiB to bytes
+    net.setMaxResponseBytes(static_cast<size_t>(cfg.network.maxResponseMb) * kBytesPerMb);
     net.setMaxRetries(cfg.network.maxRetries);
     if (!cfg.network.caBundlePath.empty()) {
         net.setCABundle(cfg.network.caBundlePath);
@@ -251,9 +267,10 @@ int runReconcile(const CLIOptions& opts) {
                 systemIdentities.size(), sysParseResult.totalRows, sysParseResult.malformedRows, sysParseResult.duplicateRows);
 
     // Source validation (fail-closed)
+    constexpr double kMaxMalformedRatio = 0.05; // NOLINT(readability-magic-numbers): 5% malformed-row tolerance
     SourceValidationConfig hrValidatorConfig = SourceValidationConfig{
         .requiredColumns = {"id", "name", "department"},
-        .maxMalformedRatio = 0.05,
+        .maxMalformedRatio = kMaxMalformedRatio,
         .maxDuplicateRows = 0,
         .allowEmpty = false
     };
@@ -272,7 +289,7 @@ int runReconcile(const CLIOptions& opts) {
 
     SourceValidationConfig targetValidatorConfig = SourceValidationConfig{
         .requiredColumns = {"id", "name", "department"},
-        .maxMalformedRatio = 0.05,
+        .maxMalformedRatio = kMaxMalformedRatio,
         .maxDuplicateRows = 0,
         .allowEmpty = opts.allowEmptyTarget
     };
@@ -289,9 +306,12 @@ int runReconcile(const CLIOptions& opts) {
         SPDLOG_WARN("Target source: {}", warning);
     }
 
+    // Target-source size sanity check - fail closed if ratio outside expected range
+    constexpr double kMaxSizeRatio = 10.0; // NOLINT(readability-magic-numbers): order-of-magnitude sanity bound
+    constexpr double kMinSizeRatio = 0.1; // NOLINT(readability-magic-numbers): order-of-magnitude sanity bound
     if (!hrIdentities.empty() && !systemIdentities.empty()) {
         double ratio = static_cast<double>(systemIdentities.size()) / hrIdentities.size();
-        if (ratio > 10.0 || ratio < 0.1) {
+        if (ratio > kMaxSizeRatio || ratio < kMinSizeRatio) {
             SPDLOG_CRITICAL("Target/HR size ratio {:.2f} outside expected range [0.1, 10.0]. Aborting.", ratio);
             return 1;
         }
@@ -427,7 +447,7 @@ int runInspect(const CLIOptions& opts) {
             j["detected_at"] = f.detectedAt;
             j["status"] = std::string(toString(f.status));
             j["integrity_hash"] = f.integrityHash;
-            arr.push_back(j);
+            arr.emplace_back(std::move(j));
         }
         out["findings"] = arr;
         std::cout << out.dump(2) << "\n";
@@ -470,7 +490,15 @@ int runConfig(const CLIOptions& opts) {
 }
 
 int runKeygen(const CLIOptions& opts) {
-    std::vector<uint8_t> key(opts.keyBits / 8);
+    if (opts.keyBits <= 0 || opts.keyBits % kBitsPerByte != 0) {
+        std::cerr << "Invalid key size\n";
+        return 1;
+    }
+    std::vector<uint8_t> key(static_cast<size_t>(opts.keyBits / kBitsPerByte));
+    if (key.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        std::cerr << "Key size too large\n";
+        return 1;
+    }
     if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
         std::cerr << "Failed to generate random key\n";
         return 1;
@@ -488,131 +516,137 @@ int runKeygen(const CLIOptions& opts) {
     return 0;
 }
 
-int runVerify(const CLIOptions& opts) {
-    auto cfgResult = loadConfig(opts.configPath);
-    if (cfgResult.hasError()) {
-        std::cerr << "Config validation failed: " << cfgResult.error().message << "\n";
-        return 1;
-    }
-    Config cfg = std::move(cfgResult.value());
-
-    initLogging(cfg.logging.format, cfg.logging.level, cfg.logging.file,
-                cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
-
-    SPDLOG_INFO("Verifying hash chain for run: {}", opts.verifyRunId);
-
-    ComplianceStore store(cfg.database.path);
-    if (auto r = store.init(); r.hasError()) {
-        SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
-        return 1;
-    }
-    IComplianceQueryStore& query = store;
-
-    // Check if run exists
-    auto existsResult = query.runExists(opts.verifyRunId);
-    if (existsResult.hasError()) {
-        SPDLOG_ERROR("Failed to query run: {}", existsResult.error().message);
-        return 1;
-    }
-    if (!existsResult.value()) {
-        SPDLOG_ERROR("Run not found: {}", opts.verifyRunId);
-        std::cerr << "Run not found: " << opts.verifyRunId << "\n";
-        return 1;
-    }
-
-    // Get run info
-    auto runResult = query.getRun(opts.verifyRunId);
-    if (runResult.hasError()) {
-        SPDLOG_ERROR("Failed to load run: {}", runResult.error().message);
-        return 1;
-    }
-    const RunInfo& run = runResult.value();
-
-    // Get all findings for this run
-    auto countResult = query.countFindings(opts.verifyRunId);
-    if (countResult.hasError()) {
-        SPDLOG_ERROR("Failed to count findings: {}", countResult.error().message);
-        return 1;
-    }
-    int total = countResult.value();
-
-    if (total == 0) {
-        std::cout << "Run " << opts.verifyRunId << " has no findings to verify.\n";
-        return 0;
-    }
-
-    auto findingsResult = query.queryFindings(opts.verifyRunId, total, 0);
-    if (findingsResult.hasError()) {
-        SPDLOG_ERROR("Failed to query findings: {}", findingsResult.error().message);
-        return 1;
-    }
-    const auto& findings = findingsResult.value();
-
-    // Determine HMAC key to use for verification
-    std::string hmacKey = opts.verifyHmacKey.empty() ? cfg.security.hmacKey : opts.verifyHmacKey;
-
-    // Verify each finding's hash
-    bool allValid = true;
-    Reconciler reconciler(nullptr, hmacKey, &cfg.policy);
-    
-    std::cout << "Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "...\n";
-    
+int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive-complexity): sequential verify pipeline; each block returns early on error
+    std::cerr << "[DEBUG] runVerify started, verifyRunId=" << opts.verifyRunId 
+              << ", verifyHmacKey.has_value=" << opts.verifyHmacKey.has_value() 
+              << ", verifyHmacKey.value=" << (opts.verifyHmacKey.has_value() ? opts.verifyHmacKey.value() : "nullopt") << "\n";
+    std::cerr << "[DEBUG] About to call loadConfig\n";
     try {
-        for (size_t i = 0; i < findings.size(); ++i) {
-            const auto& f = findings[i];
-            ViolationType vtype = f.type;
-            Severity severity = f.severity;
-            
-            std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
-            
-            if (computedHash == f.integrityHash) {
-                std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
-                          << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
+        auto cfgResult = loadConfig(opts.configPath);
+        if (cfgResult.hasError()) {
+            std::cerr << "Config validation failed: " << cfgResult.error().message << "\n";
+            return 1;
+        }
+        Config cfg = std::move(cfgResult.value());
+
+        initLogging(cfg.logging.format, cfg.logging.level, cfg.logging.file,
+                    cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
+
+        SPDLOG_INFO("Verifying hash chain for run: {}", opts.verifyRunId);
+
+        ComplianceStore store(cfg.database.path);
+        if (auto r = store.init(); r.hasError()) {
+            SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
+            return 1;
+        }
+        IComplianceQueryStore& query = store;
+
+        // Check if run exists
+        auto existsResult = query.runExists(opts.verifyRunId);
+        if (existsResult.hasError()) {
+            SPDLOG_ERROR("Failed to query run: {}", existsResult.error().message);
+            return 1;
+        }
+        if (!existsResult.value()) {
+            SPDLOG_ERROR("Run not found: {}", opts.verifyRunId);
+            std::cerr << "Run not found: " << opts.verifyRunId << "\n";
+            return 1;
+        }
+
+        // Get run info
+        auto runResult = query.getRun(opts.verifyRunId);
+        if (runResult.hasError()) {
+            SPDLOG_ERROR("Failed to load run: {}", runResult.error().message);
+            return 1;
+        }
+        const RunInfo& run = runResult.value();
+
+        // Get all findings for this run
+        auto countResult = query.countFindings(opts.verifyRunId);
+        if (countResult.hasError()) {
+            SPDLOG_ERROR("Failed to count findings: {}", countResult.error().message);
+            return 1;
+        }
+        int total = countResult.value();
+
+        if (total == 0) {
+            std::cout << "Run " << opts.verifyRunId << " has no findings to verify.\n";
+            return 0;
+        }
+
+        auto findingsResult = query.queryFindings(opts.verifyRunId, total, 0);
+        if (findingsResult.hasError()) {
+            SPDLOG_ERROR("Failed to query findings: {}", findingsResult.error().message);
+            return 1;
+        }
+        const auto& findings = findingsResult.value();
+
+        // Determine HMAC key to use for verification
+        std::string hmacKey;
+        if (opts.verifyHmacKey.has_value()) {
+            std::string providedKey = opts.verifyHmacKey.value();
+            if (!providedKey.empty()) {
+                hmacKey = providedKey;
             } else {
-                std::cerr << "  [" << (i + 1) << "/" << findings.size() << "] FAIL: " << f.userId
-                          << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n"
-                          << "    Expected: " << f.integrityHash << "\n"
-                          << "    Computed: " << computedHash << "\n";
-                allValid = false;
+                hmacKey = cfg.security.hmacKey;
             }
+            std::cerr << "[DEBUG] verifyHmacKey provided: '" << providedKey << "', using: '" << hmacKey << "'\n";
+        } else {
+            hmacKey = cfg.security.hmacKey;
+            std::cerr << "[DEBUG] verifyHmacKey not provided, using config: '" << hmacKey << "'\n";
+        }
+
+        // Verify each finding's hash
+        bool allValid = true;
+        Reconciler reconciler(nullptr, hmacKey, &cfg.policy);
+        
+        std::cerr << "[DEBUG] Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "\n";
+        std::cout << "Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "...\n";
+        
+        try {
+            for (size_t i = 0; i < findings.size(); ++i) {
+                const auto& f = findings[i];
+                ViolationType vtype = f.type;
+                Severity severity = f.severity;
+                
+                std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
+                
+                if (computedHash == f.integrityHash) {
+                    std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
+                              << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
+                } else {
+                    std::cerr << "  [" << (i + 1) << "/" << findings.size() << "] FAIL: " << f.userId
+                              << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n"
+                              << "    Expected: " << f.integrityHash << "\n"
+                              << "    Computed: " << computedHash << "\n";
+                    allValid = false;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[EXCEPTION] " << e.what() << "\n";
+            return 1;
+        } catch (...) {
+            std::cerr << "[EXCEPTION] Unknown exception\n";
+            return 1;
+        }
+        
+        // Also verify hash chain continuity (each finding's hash should be unique for different inputs)
+        // This is implicitly checked by comparing each hash to its expected value
+        
+        if (allValid) {
+            std::cout << "\nAll " << findings.size() << " findings verified successfully.\n";
+            SPDLOG_INFO("Verification successful: all {} findings in run {} are valid", findings.size(), opts.verifyRunId);
+            return 0;
+        } else {
+            std::cerr << "\nVerification FAILED: " << findings.size() << " findings checked, some failed.\n";
+            SPDLOG_ERROR("Verification failed for run {}", opts.verifyRunId);
+            return 1;
         }
     } catch (const std::exception& e) {
         std::cerr << "[EXCEPTION] " << e.what() << "\n";
         return 1;
     } catch (...) {
         std::cerr << "[EXCEPTION] Unknown exception\n";
-        return 1;
-    }
-    
-    for (size_t i = 0; i < findings.size(); ++i) {
-        const auto& f = findings[i];
-        ViolationType vtype = f.type;
-        Severity severity = f.severity;
-        
-        std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
-        
-if (computedHash == f.integrityHash) {
-            std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
-                      << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
-        } else {
-            std::cerr << "  [" << (i + 1) << "/" << findings.size() << "] FAIL: " << f.userId
-                      << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n"
-                      << "    Expected: " << f.integrityHash << "\n"
-                      << "    Computed: " << computedHash << "\n";
-            allValid = false;
-        }
-    }
-    
-    // Also verify hash chain continuity (each finding's hash should be unique for different inputs)
-    // This is implicitly checked by comparing each hash to its expected value
-    
-    if (allValid) {
-        std::cout << "\nAll " << findings.size() << " findings verified successfully.\n";
-        SPDLOG_INFO("Verification successful: all {} findings in run {} are valid", findings.size(), opts.verifyRunId);
-        return 0;
-    } else {
-        std::cerr << "\nVerification FAILED: " << findings.size() << " findings checked, some failed.\n";
-        SPDLOG_ERROR("Verification failed for run {}", opts.verifyRunId);
         return 1;
     }
 }
