@@ -143,8 +143,8 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) { // NOLI
         }
         ++result.totalRows;
 
-        int need = std::max({columns.id, columns.name, columns.department});
-        if (cols.size() > static_cast<std::size_t>(need)) {
+        const std::size_t need = std::max({columns.id, columns.name, columns.department});
+        if (cols.size() > need) {
             if (cols[columns.id].empty()) {
                 result.quarantinedRows.emplace_back(lineNumber, line, "empty id");
                 ++result.malformedRows;

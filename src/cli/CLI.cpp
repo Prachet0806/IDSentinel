@@ -36,7 +36,7 @@ std::string base64Encode(const uint8_t* data, size_t len) {
         throw std::length_error("base64 input too large");
     }
     std::string out;
-    out.resize(static_cast<size_t>(kBase64LineBlock) * ((len + 2) / 3)); // NOLINT(readability-magic-numbers): base64 4/3 expansion
+    out.resize(static_cast<size_t>(kBase64LineBlock) * ((len + 2) / static_cast<size_t>(kBase64ByteBlock))); // NOLINT(readability-magic-numbers): base64 4/3 expansion
     EVP_ENCODE_CTX* ctx = EVP_ENCODE_CTX_new();
     int outl = 0;
     EVP_EncodeInit(ctx);
@@ -272,6 +272,10 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
         .requiredColumns = {"id", "name", "department"},
         .maxMalformedRatio = kMaxMalformedRatio,
         .maxDuplicateRows = 0,
+        .minExpectedSize = std::nullopt,
+        .maxExpectedSize = std::nullopt,
+        .checkFreshness = false,
+        .maxAge = std::nullopt,
         .allowEmpty = false
     };
     SourceValidator hrValidator(hrValidatorConfig);
@@ -291,6 +295,10 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
         .requiredColumns = {"id", "name", "department"},
         .maxMalformedRatio = kMaxMalformedRatio,
         .maxDuplicateRows = 0,
+        .minExpectedSize = std::nullopt,
+        .maxExpectedSize = std::nullopt,
+        .checkFreshness = false,
+        .maxAge = std::nullopt,
         .allowEmpty = opts.allowEmptyTarget
     };
     SourceValidator targetValidator(targetValidatorConfig);
@@ -310,7 +318,8 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     constexpr double kMaxSizeRatio = 10.0; // NOLINT(readability-magic-numbers): order-of-magnitude sanity bound
     constexpr double kMinSizeRatio = 0.1; // NOLINT(readability-magic-numbers): order-of-magnitude sanity bound
     if (!hrIdentities.empty() && !systemIdentities.empty()) {
-        double ratio = static_cast<double>(systemIdentities.size()) / hrIdentities.size();
+        // NOLINTNEXTLINE(clang-diagnostic-implicit-int-float-conversion): identity counts are well below 2^53, exactly representable as double
+        double ratio = static_cast<double>(systemIdentities.size()) / static_cast<double>(hrIdentities.size());
         if (ratio > kMaxSizeRatio || ratio < kMinSizeRatio) {
             SPDLOG_CRITICAL("Target/HR size ratio {:.2f} outside expected range [0.1, 10.0]. Aborting.", ratio);
             return 1;
@@ -553,13 +562,12 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
             return 1;
         }
 
-        // Get run info
+        // Get run info (existence already confirmed above; load validates readability)
         auto runResult = query.getRun(opts.verifyRunId);
         if (runResult.hasError()) {
             SPDLOG_ERROR("Failed to load run: {}", runResult.error().message);
             return 1;
         }
-        const RunInfo& run = runResult.value();
 
         // Get all findings for this run
         auto countResult = query.countFindings(opts.verifyRunId);
@@ -606,8 +614,6 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
         try {
             for (size_t i = 0; i < findings.size(); ++i) {
                 const auto& f = findings[i];
-                ViolationType vtype = f.type;
-                Severity severity = f.severity;
                 
                 std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
                 

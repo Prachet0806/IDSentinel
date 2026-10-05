@@ -4,12 +4,23 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <openssl/evp.h>
 
 namespace {
 std::string getEnv(const char* name) {
     const char* val = std::getenv(name);
     return val ? std::string(val) : "";
+}
+
+// EVP_DecodeBlock takes an int length; base64 keys are tiny, so report
+// oversize input as invalid rather than implicitly narrowing size_t.
+bool checkedKeyLength(std::size_t n, int& out) {
+    if (n > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+    out = static_cast<int>(n);
+    return true;
 }
 
 template<typename T>
@@ -278,8 +289,12 @@ Result<void> validateConfig(const Config& cfg) {
         // 44 base64 chars ending in '=', decoding to raw length 33)
         std::string decoded;
         decoded.resize(cfg.security.hmacKey.size());
+        int keyLen = 0;
+        if (!checkedKeyLength(cfg.security.hmacKey.size(), keyLen)) {
+            return Result<void>::err(Error{ "CONFIG", "security.hmac_key must be a valid base64-encoded 32-byte key (encoding too large)" });
+        }
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-                                  reinterpret_cast<const unsigned char*>(cfg.security.hmacKey.data()), cfg.security.hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(cfg.security.hmacKey.data()), keyLen); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         const std::string& key = cfg.security.hmacKey;
         if (key.size() >= 1 && key.back() == '=') --len;
         if (key.size() >= 2 && key[key.size() - 2] == '=') --len;

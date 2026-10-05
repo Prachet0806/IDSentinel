@@ -7,10 +7,23 @@
 #include <iomanip>
 #include <thread>
 #include <vector>
+#include <limits>
+#include <stdexcept>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
 #include <algorithm>
+
+namespace {
+// EVP_DecodeBlock takes an int length; base64 keys are tiny, so reject
+// anything that does not fit rather than implicitly narrowing size_t.
+int checkedKeyLength(std::size_t n) {
+    if (n > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        throw std::length_error("HMAC key encoding too large");
+    }
+    return static_cast<int>(n);
+}
+}
 
 Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const struct PolicyConfig* policy)
     : store_(store) {
@@ -33,7 +46,7 @@ Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const s
         std::string decoded;
         decoded.resize(hmacKey.size());
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), checkedKeyLength(hmacKey.size())); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
         if (len == kHmacKeyBytes) {
@@ -134,7 +147,7 @@ std::string Reconciler::computeHashStatic(std::string_view uid, ViolationType ty
         std::string decoded;
         decoded.resize(hmacKey.size());
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), hmacKey.size()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
+                                  reinterpret_cast<const unsigned char*>(hmacKey.data()), checkedKeyLength(hmacKey.size())); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
         if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
 if (len == kHmacKeyBytes) {

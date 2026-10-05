@@ -71,7 +71,8 @@ Result<SourceValidationResult> SourceValidator::validate( // NOLINT(readability-
     // Check malformed ratio
     if (result.totalRows > 0) {
         constexpr double kPercentScale = 100.0; // NOLINT(readability-magic-numbers): ratio to percent
-        double malformedRatio = static_cast<double>(malformedRows) / result.totalRows;
+        // NOLINTNEXTLINE(clang-diagnostic-implicit-int-float-conversion): row counts are well below 2^53, exactly representable as double
+        double malformedRatio = static_cast<double>(malformedRows) / static_cast<double>(result.totalRows);
         if (malformedRatio > config_.maxMalformedRatio) {
             result.errors.push_back(
                 sourceName + " source has " + std::to_string(malformedRows) +

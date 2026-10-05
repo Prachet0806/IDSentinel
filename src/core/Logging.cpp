@@ -77,7 +77,7 @@ public:
         try {
             message = std::string(msg.payload.begin(), msg.payload.end());
             // Validate UTF-8 by attempting to parse as JSON
-            nlohmann::json::parse("\"" + message + "\"");
+            (void)nlohmann::json::parse("\"" + message + "\"");
         } catch (...) {
             // Replace invalid UTF-8 sequences with replacement character
             message = sanitizeUtf8(std::string(msg.payload.begin(), msg.payload.end()));
