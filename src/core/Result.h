@@ -5,14 +5,14 @@
 #include <functional>
 #include <optional>
 #include <cerrno>
-#include <cstring>
+#include <system_error>
 
 struct Error {
     std::string code;
     std::string message;
 
     static Error fromErrno(const char* context) {
-        return Error{ "ERRNO", std::string(context) + ": " + std::strerror(errno) };
+        return Error{ "ERRNO", std::string(context) + ": " + std::error_code(errno, std::generic_category()).message() };
     }
 };
 

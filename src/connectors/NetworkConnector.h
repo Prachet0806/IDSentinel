@@ -49,6 +49,6 @@ private:
     long connectTimeoutSec_{5}; // NOLINT(readability-magic-numbers): default 5s connect timeout
     long totalTimeoutSec_{10}; // NOLINT(readability-magic-numbers): default 10s total timeout
     std::string caBundlePath_;
-    size_t maxResponseBytes_{10 * 1024 * 1024}; // NOLINT(readability-magic-numbers): default 10 MiB cap
+    size_t maxResponseBytes_{size_t{10} * 1024 * 1024}; // NOLINT(readability-magic-numbers): default 10 MiB cap
     int maxRetries_{3};
 };

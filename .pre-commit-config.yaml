@@ -8,7 +8,6 @@ repos:
       - id: check-toml
       - id: check-json
       - id: check-merge-conflict
-      - id: debug-logger
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13
@@ -22,12 +21,14 @@ repos:
         name: clang-format
         entry: clang-format -i
         language: system
-        types: [c, cpp, h, hpp]
-        args: ['--style=file']
+        types: [file]
+        files: ^(src|tests)/.*\.(c|cc|cpp|h|hpp)$
+        args: ['--style=LLVM']
 
       - id: cppcheck
         name: cppcheck
-        entry: cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction
+        entry: cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/
         language: system
-        types: [c, cpp, h, hpp]
+        types: [file]
         pass_filenames: false
+        always_run: true

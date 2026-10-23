@@ -36,7 +36,7 @@ Result<void> SourceValidator::validateHeaders(const std::vector<std::string>& he
 Result<SourceValidationResult> SourceValidator::validate( // NOLINT(readability-function-cognitive-complexity): sequential fail-closed checks, each returns/appends independently
     const std::unordered_map<std::string, Identity>& identities,
     const std::string& sourceName,
-    size_t totalRows,
+    size_t totalRows, // NOLINT(bugprone-easily-swappable-parameters): named row counts follow CSVParseResult order
     size_t malformedRows,
     size_t duplicateRows
 ) const {
@@ -105,7 +105,11 @@ Result<SourceValidationResult> SourceValidator::validate( // NOLINT(readability-
             result.errors.push_back("Empty identity ID found in " + sourceName);
         }
         if (identity.name.empty()) {
-            result.warnings.push_back("Empty name for ID " + id + " in " + sourceName);
+            std::string warning = "Empty name for ID ";
+            warning += id;
+            warning += " in ";
+            warning += sourceName;
+            result.warnings.push_back(std::move(warning));
         }
     }
 

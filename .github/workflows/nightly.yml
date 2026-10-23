@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   strict-analysis:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # NOTE: the `runner` context is not available in job-level `env`
     # (GitHub rejects it at parse time), so paths here use `github.workspace`.
     env:
@@ -34,14 +34,18 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Install static analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18 clang-tools-18 cppcheck
+
       - name: Run clang-tidy (strict)
         run: |
-          pip install clang-tidy-review
-          run-clang-tidy-18 -p build -checks='bugprone-*,performance-*,modernize-*,readability-*,clang-analyzer-*,cppcoreguidelines-*' -header-filter='.*' -quiet || true
+          run-clang-tidy-18 -p build -j "$(nproc)" -header-filter='src/.*' -quiet -warnings-as-errors='*' 'src/.*\.cpp$'
 
       - name: Run cppcheck (strict)
         run: |
-          cppcheck --enable=all --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/ || true
+          cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem --suppress=unusedFunction src/
 
       - name: Install coverage tools
         run: pip install gcovr
@@ -54,7 +58,7 @@ jobs:
           gcovr --root . --filter 'src/.*' --exclude 'tests/.*' --print-summary
 
   dependency-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:

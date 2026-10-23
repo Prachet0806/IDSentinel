@@ -6,8 +6,42 @@
 #include <config/Config.h>
 #include <persistence/IViolationStore.h>
 #include <mocks/MockViolationStore.h>
+#include <persistence/ComplianceStore.h>
 #include <unordered_map>
 #include <string>
+
+TEST_CASE("Reconciler seals complete and empty finding sets", "[reconciler][manifest]") {
+    constexpr std::string_view key = "dGhpcyBpcyBhIHRlc3Qga2V5IGZvciBzaWduaW5nIT0=";
+    ComplianceStore store(":memory:");
+    REQUIRE(store.init().hasValue());
+    Reconciler reconciler(&store, key);
+    std::unordered_map<std::string, Identity> hr{{"101", {"101", "Alice", "Engineering"}}};
+    std::unordered_map<std::string, Identity> target{{"101", {"101", "Alice", "Engineering"}}};
+
+    auto clean = reconciler.runReconciliation(hr, target);
+    REQUIRE(clean.hasValue());
+    REQUIRE(clean.value().success);
+    auto cleanManifest = store.getRunManifest(clean.value().runId);
+    REQUIRE(cleanManifest.hasValue());
+    REQUIRE(cleanManifest.value().has_value());
+    REQUIRE(cleanManifest.value()->expectedCount == 0);
+    REQUIRE(cleanManifest.value()->signature == reconciler.manifestSignature(clean.value().runId, {}));
+
+    target.emplace("999", Identity{"999", "Unexpected", "Unknown"});
+    auto withFinding = reconciler.runReconciliation(hr, target);
+    REQUIRE(withFinding.hasValue());
+    REQUIRE(withFinding.value().success);
+    auto findings = store.queryFindings(withFinding.value().runId, 10, 0);
+    REQUIRE(findings.hasValue());
+    REQUIRE(findings.value().size() == 1);
+    auto manifest = store.getRunManifest(withFinding.value().runId);
+    REQUIRE(manifest.hasValue());
+    REQUIRE(manifest.value().has_value());
+    REQUIRE(manifest.value()->expectedCount == 1);
+    REQUIRE(manifest.value()->signature == reconciler.manifestSignature(
+        withFinding.value().runId, {findings.value()[0].integrityHash}));
+    REQUIRE(manifest.value()->signature != reconciler.manifestSignature(withFinding.value().runId, {}));
+}
 
 TEST_CASE("Reconciler - orphan account detection", "[reconciler]") {
     MockViolationStore store;

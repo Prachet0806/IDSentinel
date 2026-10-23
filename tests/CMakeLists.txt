@@ -21,6 +21,8 @@ add_executable(idsentinel_tests
     test_logging.cpp
     test_cli.cpp
     test_process_lock.cpp
+    test_schema_manager.cpp
+    test_verification.cpp
     mocks/MockViolationStore.cpp
 )
 

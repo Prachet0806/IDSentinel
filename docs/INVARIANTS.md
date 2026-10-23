@@ -15,9 +15,9 @@ This document defines the formal correctness invariants that IDSentinel must uph
 | **I5** | Dry-run → zero persistent side effects | `CLI` (skips lock, `store.init()`, all writes) | Implemented, tested |
 | **I6** | Invalid configuration → process refuses to start | `Config::loadConfig()` → `Result<Config>` | Implemented, tested |
 | **I7** | Policy configuration determines finding severity | `Reconciler` constructor | Implemented, tested |
-| **I8** | Evidence is immutable | `finding_evidence` + `trg_evidence_no_update/delete` | Implemented, tested |
+| **I8** | Application writes cannot update/delete evidence | `finding_evidence` guard triggers + `recursive_triggers=ON`; signed run manifest detects out-of-band changes without the key | Implemented locally; external DB admin can still drop triggers |
 | **I9** | Status changes are separately auditable | `finding_status` + `finding_status_history` + `trg_status_audit` | Implemented, tested |
-| **I10** | Every successful run has verifiable completion | `completeRun()` checks `sqlite3_changes()`; run-not-found is an error | Implemented, tested |
+| **I10** | Successful CLI runs have verifiable completion | `completeRun()` and `sealRun()` commit together; `verify` requires signed manifest and key | Implemented locally; CI pending |
 | **I11** | Failed/abandoned runs cannot masquerade as successful | `RunStatus::Abandoned` for stale `RUNNING` on startup | Implemented, tested |
 | **I12** | CI builds and executes actual test suite | `BUILD_TESTING=ON` + `ctest -C` matrix (Release/Debug × 3 OS) | Implemented |
 | **I13** | Clean checkout produces reproducible dependency graph | Pinned baseline in `vcpkg.json`, `vcpkg-configuration.json`, workflows | Implemented |
@@ -30,15 +30,15 @@ This document defines the formal correctness invariants that IDSentinel must uph
 ### Source Validation (I1-I4)
 - **Schema**: Every source must have required columns (`id`, `name`, `department`); header rows map by name (order-independent), headerless sources parse positionally
 - **Non-empty**: Both HR and target sources must contain at least one valid identity
-- **No duplicates**: Duplicate `id` values fail validation by default (`maxDuplicateRows=0`, configurable)
+- **No duplicates**: Duplicate `id` values fail reconciliation (`maxDuplicateRows=0`)
 - **Malformed threshold**: Configurable ratio of malformed rows allowed (default: 5%)
-- **Size sanity**: Target/HR size ratio outside [0.1, 10.0] warns; optional min/max size bounds warn
+- **Size sanity**: Target/HR size ratio outside [0.1, 10.0] aborts reconciliation
 
 ### Configuration (I6)
 - All config values validated at startup; `loadConfig()` returns `Result<Config>`
 - Missing/invalid numeric values (timeout, sizes, retries) → hard error
 - Malformed HMAC key → hard error (fail closed)
-- Unknown enum strings (severity, log level/format) fall back to documented defaults (`MEDIUM`/`INFO`/`JSON`) — see known gap below
+- Unknown enum strings (severity, log level/format) are errors
 
 ### Policy (I7)
 - `PolicyConfig` from config/environment must be passed to `Reconciler`
@@ -56,6 +56,7 @@ This document defines the formal correctness invariants that IDSentinel must uph
 - **Run lifecycle**: `RUNNING` → `SUCCESS` | `FAILED` | `ABANDONED`
 - **Stale detection**: On startup, ANY `RUNNING` run (crashed predecessor) → `ABANDONED`
 - **Completion proof**: `completeRun()` on a nonexistent run returns `RUN_NOT_FOUND`
+- **Signed evidence**: CLI-created successful runs have a versioned HMAC manifest covering run ID, finding count, and ordered hashes. Legacy or unsigned runs are unverifiable.
 - **Single writer**: Exclusive `<db>.lock` refuses concurrent runs
 
 ### Transport (supporting I1)
@@ -78,7 +79,8 @@ This document defines the formal correctness invariants that IDSentinel must uph
 
 ## Known Gaps
 
-- **I6 (enum fallback)**: unknown `severity`/`level`/`format` strings silently fall back to defaults instead of hard-erroring. Numeric, required, and HMAC-key values already fail closed. Tightening enums to hard errors is a deliberate follow-up (it changes `parseSeverity`/`parseLogLevel`/`parseLogFormat` contracts and their tests).
+- SQLite files are not an independent trust anchor. A DB administrator with the HMAC key can rewrite and re-sign evidence; keep the key outside the database and back up or export manifests independently when stronger provenance is needed.
+- Databases containing the pre-split `compliance_findings` schema are refused until an explicit migration path is provided.
 
 ---
 

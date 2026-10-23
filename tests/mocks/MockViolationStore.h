@@ -26,6 +26,7 @@ public:
     Result<void> commitTransaction() override;
     Result<void> rollbackTransaction() override;
     Result<void> completeRun(const std::string&, RunStatus) override;
+    Result<void> sealRun(const std::string&, int, const std::string&) override { return Result<void>::ok(); }
     Result<void> prepareBulkInsert() override;
     Result<void> bulkInsertViolation(const ViolationRecord&, const std::string&, const std::string&) override;
     Result<void> finalizeBulkInsert() override;
@@ -35,6 +36,9 @@ public:
     Result<std::vector<FindingView>> queryFindings(
         const std::string& runId, int limit, int offset) override;
     Result<int> countFindings(const std::string& runId) override;
+    Result<std::optional<RunManifest>> getRunManifest(const std::string&) override {
+        return Result<std::optional<RunManifest>>::ok(std::nullopt);
+    }
 
     void setFailAt(const std::string& point);
     const std::vector<LoggedViolation>& getViolations() const;

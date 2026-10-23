@@ -13,6 +13,7 @@
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
 #include <algorithm>
+#include <ctime>
 
 namespace {
 // EVP_DecodeBlock takes an int length; base64 keys are tiny, so reject
@@ -22,6 +23,20 @@ int checkedKeyLength(std::size_t n) {
         throw std::length_error("HMAC key encoding too large");
     }
     return static_cast<int>(n);
+}
+
+std::string utcTimestamp() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#ifdef _WIN32
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    char buffer[32];
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
+        throw std::runtime_error("Could not format UTC detection time");
+    return buffer;
 }
 }
 
@@ -47,7 +62,7 @@ Reconciler::Reconciler(IViolationStore* store, std::string_view hmacKey, const s
         decoded.resize(hmacKey.size());
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
                                   reinterpret_cast<const unsigned char*>(hmacKey.data()), checkedKeyLength(hmacKey.size())); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-        if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
+        if (!hmacKey.empty() && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
         if (len == kHmacKeyBytes) {
             std::copy_n(reinterpret_cast<const std::uint8_t*>(decoded.data()), kHmacKeyBytes, hmacKey_.begin()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL byte buffer to uint8_t key
@@ -148,17 +163,49 @@ std::string Reconciler::computeHashStatic(std::string_view uid, ViolationType ty
         decoded.resize(hmacKey.size());
         int len = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
                                   reinterpret_cast<const unsigned char*>(hmacKey.data()), checkedKeyLength(hmacKey.size())); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-        if (hmacKey.size() >= 1 && hmacKey.back() == '=') --len;
+        if (!hmacKey.empty() && hmacKey.back() == '=') --len;
         if (hmacKey.size() >= 2 && hmacKey[hmacKey.size() - 2] == '=') --len;
-if (len == kHmacKeyBytes) {
+        if (len == kHmacKeyBytes) {
         return hmacSha256(reinterpret_cast<const std::uint8_t*>(decoded.data()), kHmacKeyBytes, data); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL byte buffer to uint8_t key
-    }
+        }
+        throw std::runtime_error("Invalid HMAC key: expected 32 decoded bytes");
     }
     return sha256(data);
 }
 
 std::string Reconciler::verifyHash(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey) {
     return computeHashStatic(uid, type, severity, hmacKey);
+}
+
+std::string Reconciler::manifestSignature(std::string_view runId, const std::vector<std::string>& hashes) const {
+    if (!hasHmacKey_) throw std::runtime_error("A valid HMAC key is required to seal or verify a run");
+    // Length prefixes and a domain tag keep this encoding unambiguous and
+    // separate manifest signatures from individual finding hashes.
+    std::string data = "IDSENTINEL-MANIFEST-V2:";
+    data += std::to_string(runId.size());
+    data += ':';
+    data += runId;
+    data += ':';
+    data += std::to_string(hashes.size());
+    data += ':';
+    for (const auto& hash : hashes) {
+        data += std::to_string(hash.size());
+        data += ':';
+        data += hash;
+    }
+    return hmacSha256(hmacKey_.data(), hmacKey_.size(), data);
+}
+
+std::string Reconciler::findingSignature(std::string_view runId, std::string_view uid,
+                                         ViolationType type, Severity severity, std::string_view detectedAt) const {
+    if (!hasHmacKey_) throw std::runtime_error("A valid HMAC key is required to sign a finding");
+    std::string data = "IDSENTINEL-FINDING-V2:";
+    for (const std::string_view field : {runId, uid, toString(type), toString(severity), detectedAt}) {
+        data += std::to_string(field.size());
+        data += ':';
+        data += field;
+    }
+    return hmacSha256(hmacKey_.data(), hmacKey_.size(), data);
 }
 
 Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLINT(readability-function-cognitive-complexity): orchestration intentionally linear; helpers below keep each phase testable
@@ -172,6 +219,7 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLIN
 
     ReconciliationResult result;
     result.runId = generateRunID();
+    std::vector<std::string> findingHashes;
 
     SPDLOG_INFO("Starting reconciliation run: {}", result.runId);
 
@@ -219,16 +267,20 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLIN
 
     auto emitViolation = [&](const std::string& id, ViolationType type, Severity severity,
                              const std::string& detail) -> bool {
-        std::string hash = computeHash(id, type, severity);
+        const std::string detectedAt = hasHmacKey_ ? utcTimestamp() : "";
+        std::string hash = hasHmacKey_
+            ? findingSignature(result.runId, id, type, severity, detectedAt)
+            : computeHash(id, type, severity);
         if (mode == RunMode::DryRun) {
             SPDLOG_INFO("[DRY-RUN] {}: {} (ID: {})", std::string(toString(type)), detail, id);
         } else if (store_) {
-            ViolationRecord vr{ id, type, severity };
+            ViolationRecord vr{ id, type, severity, detectedAt };
             if (auto r = store_->bulkInsertViolation(vr, result.runId, hash); r.hasError()) {
                 SPDLOG_ERROR("Failed to log {} violation for {}: {}",
                              std::string(toString(type)), id, r.error().message);
                 return false;
             }
+            findingHashes.push_back(hash);
             SPDLOG_WARN("{} Detected: {} (ID: {})", std::string(toString(type)), detail, id);
         }
         return true;
@@ -300,7 +352,15 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLIN
     }
 
     if (mode != RunMode::DryRun && store_) {
-        if (auto r = store_->commitTransaction(); r.hasError()) {
+        if (hasHmacKey_) {
+            auto signature = manifestSignature(result.runId, findingHashes);
+            if (auto r = store_->sealRun(result.runId, static_cast<int>(findingHashes.size()), signature); r.hasError()) {
+                store_->rollbackTransaction();
+                store_->completeRun(result.runId, RunStatus::Failed);
+                return Result<ReconciliationResult>::err(r.error());
+            }
+        }
+        if (auto r = store_->completeRun(result.runId, RunStatus::Success); r.hasError()) {
             if (auto rr = store_->rollbackTransaction(); rr.hasError()) {
                 SPDLOG_ERROR("Secondary rollback failure for run {}: {}", result.runId, rr.error().message);
             }
@@ -309,7 +369,13 @@ Result<Reconciler::ReconciliationResult> Reconciler::runReconciliation( // NOLIN
             }
             return Result<ReconciliationResult>::err(r.error());
         }
-        if (auto r = store_->completeRun(result.runId, RunStatus::Success); r.hasError()) {
+        if (auto r = store_->commitTransaction(); r.hasError()) {
+            if (auto rr = store_->rollbackTransaction(); rr.hasError()) {
+                SPDLOG_ERROR("Secondary rollback failure for run {}: {}", result.runId, rr.error().message);
+            }
+            if (auto rc = store_->completeRun(result.runId, RunStatus::Failed); rc.hasError()) {
+                SPDLOG_ERROR("Secondary failure marking run {} FAILED: {}", result.runId, rc.error().message);
+            }
             return Result<ReconciliationResult>::err(r.error());
         }
     }

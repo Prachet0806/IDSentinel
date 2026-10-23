@@ -4,9 +4,10 @@
 #include <string>
 #include <optional>
 #include <filesystem>
+#include <cstdint>
 
 struct CLIOptions {
-    enum class Command { Reconcile, Inspect, Config, Keygen, Verify } command = Command::Reconcile;
+    enum class Command : std::uint8_t { Reconcile, Inspect, Config, Keygen, Verify } command = Command::Reconcile;
     std::optional<std::filesystem::path> configPath;
     bool dryRun = false;
     bool allowEmptyTarget = false;

@@ -42,6 +42,7 @@ set(IDSentinel_SOURCES
     src/connectors/NetworkConnector.cpp
     src/parsers/CSVParser.cpp
     src/persistence/ComplianceStore.cpp
+    src/persistence/SchemaManager.cpp
 )
 
 # --- 5. Build Library Target ---

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <array>
 #include <cstdint>
+#include <vector>
 
 class Reconciler {
 public:
@@ -19,7 +20,7 @@ public:
     Reconciler(const Reconciler&) = delete;
     Reconciler& operator=(const Reconciler&) = delete;
 
-    enum class RunMode { Normal, DryRun };
+    enum class RunMode : std::uint8_t { Normal, DryRun };
 
     struct ReconciliationResult {
         std::string runId;
@@ -37,6 +38,9 @@ public:
 
     // Static method for external verification
     static std::string verifyHash(std::string_view uid, ViolationType type, Severity severity, std::string_view hmacKey);
+    std::string manifestSignature(std::string_view runId, const std::vector<std::string>& hashes) const;
+    std::string findingSignature(std::string_view runId, std::string_view uid,
+                                 ViolationType type, Severity severity, std::string_view detectedAt) const;
 
 private:
     IViolationStore* store_;

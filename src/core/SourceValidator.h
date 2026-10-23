@@ -9,7 +9,7 @@
 
 struct SourceValidationConfig {
     std::vector<std::string> requiredColumns = {"id", "name", "department"};
-    double maxMalformedRatio = 0.05;  // 5% default
+    double maxMalformedRatio = 0.05;  // NOLINT(readability-magic-numbers): 5% default tolerance
     size_t maxDuplicateRows = 0;      // 0 = fail on any duplicate
     std::optional<size_t> minExpectedSize;
     std::optional<size_t> maxExpectedSize;

@@ -19,6 +19,40 @@ std::string trimAndLower(std::string s) { // NOLINT(performance-unnecessary-valu
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
 }
+
+// UTF-8 byte ranges are defined by the encoding standard.
+// NOLINTBEGIN(readability-magic-numbers)
+bool validUtf8(const std::string& text) { // NOLINT(readability-function-cognitive-complexity): validates each UTF-8 byte class
+    for (size_t i = 0; i < text.size();) {
+        const auto first = static_cast<unsigned char>(text[i]);
+        if (first < 0x80) { ++i; continue; }
+        size_t length = 0;
+        if (first >= 0xC2 && first <= 0xDF) length = 2;
+        else if (first >= 0xE0 && first <= 0xEF) length = 3;
+        else if (first >= 0xF0 && first <= 0xF4) length = 4;
+        else return false;
+        if (i + length > text.size()) return false;
+        for (size_t j = 1; j < length; ++j) {
+            if ((static_cast<unsigned char>(text[i + j]) & 0xC0) != 0x80) return false;
+        }
+        const auto second = static_cast<unsigned char>(text[i + 1]);
+        if ((first == 0xE0 && second < 0xA0) || (first == 0xED && second >= 0xA0) ||
+            (first == 0xF0 && second < 0x90) || (first == 0xF4 && second >= 0x90)) return false;
+        i += length;
+    }
+    return true;
+}
+// NOLINTEND(readability-magic-numbers)
+
+bool balancedQuotes(const std::string& record) {
+    bool quoted = false;
+    for (size_t i = 0; i < record.size(); ++i) {
+        if (record[i] != '"') continue;
+        if (quoted && i + 1 < record.size() && record[i + 1] == '"') { ++i; continue; }
+        quoted = !quoted;
+    }
+    return !quoted;
+}
 }
 
 bool CSVParser::isHeaderLine(const std::string& line) {
@@ -124,6 +158,23 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) { // NOLI
 
         if (line.empty()) continue;
 
+        constexpr size_t kMaxRecordBytes = 1024 * 1024; // NOLINT(readability-magic-numbers): one MiB CSV record limit
+        while (!balancedQuotes(line)) {
+            std::string continuation;
+            if (!std::getline(input, continuation)) {
+                return Result<CSVParseResult>::err(Error{"CSV_QUOTES", "Unterminated quoted field at line " + std::to_string(lineNumber)});
+            }
+            ++lineNumber;
+            if (line.size() + continuation.size() + 1 > kMaxRecordBytes) {
+                return Result<CSVParseResult>::err(Error{"CSV_SIZE", "CSV record exceeds one MiB"});
+            }
+            line += '\n';
+            line += continuation;
+        }
+        if (line.size() > kMaxRecordBytes || !validUtf8(line)) {
+            return Result<CSVParseResult>::err(Error{"CSV_ENCODING", "Invalid or oversized UTF-8 CSV record at line " + std::to_string(lineNumber)});
+        }
+
         std::vector<std::string> cols = parseRow(line);
 
         if (firstNonEmpty) {
@@ -192,7 +243,7 @@ Result<CSVParseResult> CSVParser::parseFile(const std::filesystem::path& path) {
     return result;
 }
 
-Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) { // NOLINT(readability-function-cognitive-complexity): legacy streaming path kept small; structured parsing lives in parseFromStream
+Result<void> CSVParser::parseStream(std::istream& input, const RowCallback& callback) { // NOLINT(readability-function-cognitive-complexity): structured parsing lives in parseFromStream
     std::string line;
     bool firstNonEmpty = true;
     size_t lineNum = 0;
@@ -200,6 +251,23 @@ Result<void> CSVParser::parseStream(std::istream& input, RowCallback callback) {
     while (std::getline(input, line)) {
         ++lineNum;
         if (line.empty()) continue;
+
+        constexpr size_t kMaxRecordBytes = 1024 * 1024; // NOLINT(readability-magic-numbers): one MiB CSV record limit
+        while (!balancedQuotes(line)) {
+            std::string continuation;
+            if (!std::getline(input, continuation)) {
+                return Result<void>::err(Error{"CSV_QUOTES", "Unterminated quoted field at line " + std::to_string(lineNum)});
+            }
+            ++lineNum;
+            if (line.size() + continuation.size() + 1 > kMaxRecordBytes) {
+                return Result<void>::err(Error{"CSV_SIZE", "CSV record exceeds one MiB"});
+            }
+            line += '\n';
+            line += continuation;
+        }
+        if (line.size() > kMaxRecordBytes || !validUtf8(line)) {
+            return Result<void>::err(Error{"CSV_ENCODING", "Invalid or oversized UTF-8 CSV record at line " + std::to_string(lineNum)});
+        }
 
         if (firstNonEmpty && isHeaderLine(line)) {
             firstNonEmpty = false;

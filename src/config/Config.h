@@ -7,6 +7,9 @@
 #include "core/Logging.h"
 #include "core/Result.h"
 
+inline constexpr int kDefaultBusyTimeoutMs = 5000; // SQLite busy wait in milliseconds.
+inline constexpr size_t kDefaultLogRetentionFiles = 30;
+
 struct NetworkConfig {
     std::string hrFeedUrl = "https://gist.githubusercontent.com/dummy/raw/hr_feed.csv";
     int timeoutSeconds = 10;
@@ -18,7 +21,7 @@ struct NetworkConfig {
 struct DatabaseConfig {
     std::filesystem::path path;
     bool walMode = true;
-    int busyTimeoutMs = 5000;
+    int busyTimeoutMs = kDefaultBusyTimeoutMs;
 };
 
 struct PolicyConfig {
@@ -31,6 +34,8 @@ struct SourceConfig {
     // Maximum age (hours) of a file-backed source before it is rejected.
     // 0 = freshness check disabled.
     int maxFileAgeHours = 0;
+    std::filesystem::path hrFallbackPath;
+    std::filesystem::path targetPath;
 };
 
 struct LoggingConfig {
@@ -38,13 +43,13 @@ struct LoggingConfig {
     LogFormat format = LogFormat::Json;
     std::filesystem::path file;
     size_t maxFileSizeMb = 10;
-    size_t maxFiles = 30;
-    bool dailyRotation = true;
+    size_t maxFiles = kDefaultLogRetentionFiles;
+    bool dailyRotation = false;
 
     struct RotationConfig {
         size_t maxSizeMb = 10;
-        size_t maxFiles = 30;
-        bool daily = true;
+        size_t maxFiles = kDefaultLogRetentionFiles;
+        bool daily = false;
     };
     std::optional<RotationConfig> rotation;
 };

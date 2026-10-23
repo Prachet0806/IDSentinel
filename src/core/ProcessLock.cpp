@@ -64,7 +64,7 @@ Result<bool> ProcessLock::tryAcquire() {
             return Result<bool>::err(Error{ "LOCK_IO", "Cannot create lock directory: " + ec.message() });
         }
     }
-    fd_ = open(lockPath_.c_str(), O_RDWR | O_CREAT, 0600);
+    fd_ = open(lockPath_.c_str(), O_RDWR | O_CREAT, 0600); // NOLINT(readability-magic-numbers): owner-only POSIX file mode
     if (fd_ < 0) {
         return Result<bool>::err(Error{ "LOCK_IO", std::string("Cannot open lock file: ") + std::strerror(errno) });
     }

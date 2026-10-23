@@ -43,6 +43,26 @@ TEST_CASE("CSVParser::parse - quoted fields", "[csv]") {
     REQUIRE(parseResult.identities["102"].name == "Bob \"The Boss\"");
 }
 
+TEST_CASE("CSVParser rejects invalid UTF-8 and unfinished quotes", "[csv]") {
+    std::string invalid = "101,Alice,Engineering\n102,";
+    invalid.push_back(static_cast<char>(0xC0));
+    invalid.push_back(static_cast<char>(0xAF));
+    invalid += ",Sales\n";
+    auto encoding = CSVParser::parse(invalid);
+    REQUIRE(encoding.hasError());
+    REQUIRE(encoding.error().code == "CSV_ENCODING");
+
+    auto quotes = CSVParser::parse("101,\"unfinished,Engineering\n");
+    REQUIRE(quotes.hasError());
+    REQUIRE(quotes.error().code == "CSV_QUOTES");
+}
+
+TEST_CASE("CSVParser reads quoted fields across physical lines", "[csv]") {
+    auto result = CSVParser::parse("id,name,department\n101,\"Alice\nEngineer\",Engineering\n");
+    REQUIRE(result.hasValue());
+    REQUIRE(result.value().identities.at("101").name == "Alice\nEngineer");
+}
+
 TEST_CASE("CSVParser::parse - empty lines skipped", "[csv]") {
     std::string csv = "\n101,Alice,Engineering\n\n102,Bob,Sales\n";
     auto result = CSVParser::parse(csv);

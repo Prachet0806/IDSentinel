@@ -27,7 +27,7 @@ public:
     using RowCallback = std::function<void(const std::vector<std::string>&)>;
 
     static Result<CSVParseResult> parse(const std::string& csv);
-    static Result<void> parseStream(std::istream& input, RowCallback callback);
+    static Result<void> parseStream(std::istream& input, const RowCallback& callback);
     // Streams straight from disk: peaks at the identity map only, never
     // holding both the raw file contents and the map in memory at once.
     static Result<CSVParseResult> parseFile(const std::filesystem::path& path);

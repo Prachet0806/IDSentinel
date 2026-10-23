@@ -32,7 +32,12 @@ bool devDisableTls() {
 }
 
 bool transientHttp(long httpCode) {
-    return httpCode == 408 || httpCode == 429 || (httpCode >= 500 && httpCode < 600);
+    constexpr long kRequestTimeout = 408;
+    constexpr long kTooManyRequests = 429;
+    constexpr long kServerErrorStart = 500;
+    constexpr long kServerErrorEnd = 600;
+    return httpCode == kRequestTimeout || httpCode == kTooManyRequests ||
+           (httpCode >= kServerErrorStart && httpCode < kServerErrorEnd);
 }
 }
 
@@ -52,7 +57,7 @@ NetworkConnector::~NetworkConnector() {
     if (curl_) curl_easy_cleanup(curl_);
 }
 
-void NetworkConnector::setTimeouts(long connectTimeoutSec, long totalTimeoutSec) {
+void NetworkConnector::setTimeouts(long connectTimeoutSec, long totalTimeoutSec) { // NOLINT(bugprone-easily-swappable-parameters): public API documents both named timeout roles
     connectTimeoutSec_ = connectTimeoutSec;
     totalTimeoutSec_ = totalTimeoutSec;
 }
@@ -155,7 +160,9 @@ Result<std::string> NetworkConnector::performOnce(const std::string& url) {
 
     long httpCode = 0;
     curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
-    if (httpCode < 200 || httpCode >= 300) {
+    constexpr long kSuccessStart = 200;
+    constexpr long kSuccessEnd = 300;
+    if (httpCode < kSuccessStart || httpCode >= kSuccessEnd) {
         SPDLOG_ERROR("HTTP error {} for {}", httpCode, redactUrlForLogging(url));
         if (transientHttp(httpCode)) {
             return Result<std::string>::err(Error{ "HTTP_TRANSIENT", "HTTP " + std::to_string(httpCode) });

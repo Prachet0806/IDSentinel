@@ -1,28 +1,29 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <cstdint>
 
-enum class ViolationType {
+enum class ViolationType : std::uint8_t {
     OrphanAccount,
     MissingAccount,
     AttributeDrift
 };
 
-enum class Severity {
+enum class Severity : std::uint8_t {
     Critical,
     High,
     Medium,
     Low
 };
 
-enum class RunStatus {
+enum class RunStatus : std::uint8_t {
     Running,
     Success,
     Failed,
     Abandoned
 };
 
-enum class FindingStatus {
+enum class FindingStatus : std::uint8_t {
     Open,
     Review,
     Remediated

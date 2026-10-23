@@ -28,6 +28,11 @@ struct RunInfo {
     int totalViolations = 0;
 };
 
+struct RunManifest {
+    int expectedCount = 0;
+    std::string signature;
+};
+
 // I9/I10: reads go through a dedicated query interface so the write path
 // (IViolationStore) and read path can evolve independently.
 class IComplianceQueryStore {
@@ -39,4 +44,5 @@ public:
     virtual Result<std::vector<FindingView>> queryFindings(
         const std::string& runId, int limit, int offset) = 0;
     virtual Result<int> countFindings(const std::string& runId) = 0;
+    virtual Result<std::optional<RunManifest>> getRunManifest(const std::string& runId) = 0;
 };

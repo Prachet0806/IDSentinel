@@ -7,16 +7,23 @@
 
 class ComplianceStore final : public IViolationStore, public IComplianceQueryStore {
 public:
-    explicit ComplianceStore(const std::filesystem::path& dbPath, bool walMode = true, int busyTimeoutMs = 5000);
+    explicit ComplianceStore(const std::filesystem::path& dbPath, bool walMode = true, int busyTimeoutMs = 5000); // NOLINT(readability-magic-numbers): SQLite default busy timeout
     ~ComplianceStore() override;
 
     Result<void> init() override;
+    // Write path: opens RW, runs SchemaManager::migrate(), recovers stale
+    // RUNNING runs. init() delegates here for IViolationStore compatibility.
+    Result<void> openForWrite();
+    // Read path for inspect/verify: SQLITE_OPEN_READONLY, no migration, no
+    // pragmas that write, no stale-run sweep. Never mutates durable state.
+    Result<void> openReadOnly();
     Result<void> startRun(const RunRecord& record) override;
     Result<void> logViolation(const ViolationRecord& record, const std::string& runId, const std::string& integrityHash) override;
     Result<void> beginTransaction() override;
     Result<void> commitTransaction() override;
     Result<void> rollbackTransaction() override;
     Result<void> completeRun(const std::string& runId, RunStatus status) override;
+    Result<void> sealRun(const std::string& runId, int expectedCount, const std::string& signature) override;
 
     // Bulk operations for performance
     Result<void> prepareBulkInsert() override;
@@ -29,6 +36,7 @@ public:
     Result<std::vector<FindingView>> queryFindings(
         const std::string& runId, int limit, int offset) override;
     Result<int> countFindings(const std::string& runId) override;
+    Result<std::optional<RunManifest>> getRunManifest(const std::string& runId) override;
 
 private:
     sqlite3* db_ = nullptr;
@@ -42,4 +50,6 @@ private:
     Result<void> execSimple(const std::string& sql, const std::string& context);
     Result<void> bindText(sqlite3_stmt* stmt, int index, const std::string& value);
     Result<void> bindInt(sqlite3_stmt* stmt, int index, int value);
+    Result<void> openDatabase(bool readOnly);
+    void closeDatabase();
 };

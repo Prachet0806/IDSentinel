@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -36,15 +37,12 @@ std::string base64Encode(const uint8_t* data, size_t len) {
         throw std::length_error("base64 input too large");
     }
     std::string out;
-    out.resize(static_cast<size_t>(kBase64LineBlock) * ((len + 2) / static_cast<size_t>(kBase64ByteBlock))); // NOLINT(readability-magic-numbers): base64 4/3 expansion
-    EVP_ENCODE_CTX* ctx = EVP_ENCODE_CTX_new();
-    int outl = 0;
-    EVP_EncodeInit(ctx);
-    EVP_EncodeUpdate(ctx, reinterpret_cast<unsigned char*>(out.data()), &outl, data, static_cast<int>(len)); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-    int final_len = 0;
-    EVP_EncodeFinal(ctx, reinterpret_cast<unsigned char*>(out.data() + outl), &final_len); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL C API requires unsigned char*
-    EVP_ENCODE_CTX_free(ctx);
-    out.resize(static_cast<size_t>(outl + final_len));
+    const size_t encodedSize = static_cast<size_t>(kBase64LineBlock) *
+        ((len + static_cast<size_t>(kBase64ByteBlock - 1)) / static_cast<size_t>(kBase64ByteBlock));
+    out.resize(encodedSize + 1); // EVP_EncodeBlock writes a terminating NUL.
+    const int written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), data, static_cast<int>(len));
+    if (written < 0) throw std::runtime_error("Base64 encoding failed");
+    out.resize(static_cast<size_t>(written));
     return out;
 }
 
@@ -124,6 +122,10 @@ Result<CLIOptions> parseCLI(int argc, char* argv[]) { // NOLINT(readability-func
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
+        if (e.get_exit_code() == 0) {
+            app.exit(e);
+            return Result<CLIOptions>::err(Error{"CLI_HELP", "help displayed"});
+        }
         return Result<CLIOptions>::err(Error{ "CLI_PARSE", e.what() });
     } catch (const std::exception& e) {
         return Result<CLIOptions>::err(Error{ "CLI_PARSE_EXCEPTION", e.what() });
@@ -153,7 +155,13 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     }
     Config cfg = std::move(cfgResult.value());
 
-    initLogging(cfg.logging.format, cfg.logging.level, cfg.logging.file,
+    if (!opts.dryRun && cfg.security.hmacKey.empty()) {
+        std::cerr << "A 256-bit HMAC key is required for a durable reconciliation run. Set IDSENTINEL_SECURITY__HMAC_KEY.\n";
+        return 1;
+    }
+
+    initLogging(cfg.logging.format, cfg.logging.level,
+                opts.dryRun ? std::optional<std::filesystem::path>{} : std::optional<std::filesystem::path>{cfg.logging.file},
                 cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
 
     SPDLOG_INFO("Starting IDSentinel reconciliation");
@@ -183,7 +191,7 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     }
 
     // Check for empty response (204 No Content or empty body)
-    if (hrCsv.empty()) {
+    if (!hrResult.hasError() && hrCsv.empty()) {
         if (opts.allowLocalFallback) {
             SPDLOG_WARN("HR feed response is empty. Falling back to local cache.");
         } else {
@@ -224,10 +232,18 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     };
 
     if (hrIdentities.empty()) {
+        if (!opts.allowLocalFallback) {
+            SPDLOG_CRITICAL("HR feed contains no valid identities; local fallback disabled.");
+            return 1;
+        }
         // Fallback to local file (streamed from disk)
-        std::filesystem::path localPath = "data/hr_feed.csv";
+        std::filesystem::path localPath = cfg.source.hrFallbackPath;
+        if (localPath.empty()) {
+            SPDLOG_CRITICAL("Local HR fallback requested but source.hr_fallback_path is not configured.");
+            return 1;
+        }
         if (std::filesystem::exists(localPath)) {
-            SPDLOG_INFO("Loading HR feed from local file: {}", localPath.string());
+            SPDLOG_WARN("Using local HR fallback file: {}", localPath.string());
             if (!checkFreshness(localPath, "HR")) return 1;
             auto parseResult = CSVParser::parseFile(localPath);
             if (parseResult.hasError()) {
@@ -247,7 +263,11 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
                 hrIdentities.size(), hrParseResult.totalRows, hrParseResult.malformedRows, hrParseResult.duplicateRows);
 
     // Load system dump
-    std::filesystem::path systemPath = "data/system_dump.csv";
+    std::filesystem::path systemPath = cfg.source.targetPath;
+    if (systemPath.empty()) {
+        SPDLOG_CRITICAL("Target source path is not configured (source.target_path).");
+        return 1;
+    }
     if (!std::filesystem::exists(systemPath)) {
         SPDLOG_CRITICAL("System dump not found: {}", systemPath.string());
         return 1;
@@ -355,8 +375,8 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     std::unique_ptr<ComplianceStore> store;
     if (!opts.dryRun) {
         store = std::make_unique<ComplianceStore>(cfg.database.path, cfg.database.walMode, cfg.database.busyTimeoutMs);
-        if (auto r = store->init(); r.hasError()) {
-            SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
+        if (auto r = store->openForWrite(); r.hasError()) {
+            SPDLOG_ERROR("Failed to open database for writing: {}", r.error().message);
             return 1;
         }
     }
@@ -398,8 +418,8 @@ int runInspect(const CLIOptions& opts) {
                 cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
 
     ComplianceStore store(cfg.database.path);
-    if (auto r = store.init(); r.hasError()) {
-        SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
+    if (auto r = store.openReadOnly(); r.hasError()) {
+        SPDLOG_ERROR("Failed to open database read-only: {}", r.error().message);
         return 1;
     }
     IComplianceQueryStore& query = store;
@@ -459,7 +479,7 @@ int runInspect(const CLIOptions& opts) {
             arr.emplace_back(std::move(j));
         }
         out["findings"] = arr;
-        std::cout << out.dump(2) << "\n";
+        std::cout << out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace) << "\n";
     } else {
         std::cout << std::format("Run: {}  Status: {}  Findings: {} (showing {} starting at offset {})\n",
             run.runId, toString(run.status), total,
@@ -526,10 +546,8 @@ int runKeygen(const CLIOptions& opts) {
 }
 
 int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive-complexity): sequential verify pipeline; each block returns early on error
-    std::cerr << "[DEBUG] runVerify started, verifyRunId=" << opts.verifyRunId 
-              << ", verifyHmacKey.has_value=" << opts.verifyHmacKey.has_value() 
-              << ", verifyHmacKey.value=" << (opts.verifyHmacKey.has_value() ? opts.verifyHmacKey.value() : "nullopt") << "\n";
-    std::cerr << "[DEBUG] About to call loadConfig\n";
+    // NOTE: never log key material. Only whether a key was supplied.
+    SPDLOG_DEBUG("runVerify started for run: {}", opts.verifyRunId);
     try {
         auto cfgResult = loadConfig(opts.configPath);
         if (cfgResult.hasError()) {
@@ -541,11 +559,11 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
         initLogging(cfg.logging.format, cfg.logging.level, cfg.logging.file,
                     cfg.logging.maxFileSizeMb, cfg.logging.maxFiles, cfg.logging.dailyRotation);
 
-        SPDLOG_INFO("Verifying hash chain for run: {}", opts.verifyRunId);
+        SPDLOG_INFO("Verifying signed manifest for run: {}", opts.verifyRunId);
 
         ComplianceStore store(cfg.database.path);
-        if (auto r = store.init(); r.hasError()) {
-            SPDLOG_ERROR("Failed to initialize database: {}", r.error().message);
+        if (auto r = store.openReadOnly(); r.hasError()) {
+            SPDLOG_ERROR("Failed to open database read-only: {}", r.error().message);
             return 1;
         }
         IComplianceQueryStore& query = store;
@@ -568,6 +586,10 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
             SPDLOG_ERROR("Failed to load run: {}", runResult.error().message);
             return 1;
         }
+        if (runResult.value().status != RunStatus::Success) {
+            std::cerr << "Only completed successful runs can be verified.\n";
+            return 1;
+        }
 
         // Get all findings for this run
         auto countResult = query.countFindings(opts.verifyRunId);
@@ -577,11 +599,6 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
         }
         int total = countResult.value();
 
-        if (total == 0) {
-            std::cout << "Run " << opts.verifyRunId << " has no findings to verify.\n";
-            return 0;
-        }
-
         auto findingsResult = query.queryFindings(opts.verifyRunId, total, 0);
         if (findingsResult.hasError()) {
             SPDLOG_ERROR("Failed to query findings: {}", findingsResult.error().message);
@@ -589,35 +606,56 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
         }
         const auto& findings = findingsResult.value();
 
-        // Determine HMAC key to use for verification
+        auto manifestResult = query.getRunManifest(opts.verifyRunId);
+        if (manifestResult.hasError()) {
+            std::cerr << "Cannot load run manifest: " << manifestResult.error().message << "\n";
+            return 1;
+        }
+        if (!manifestResult.value().has_value()) {
+            std::cerr << "Run has no signed manifest and cannot be verified.\n";
+            return 1;
+        }
+        const auto& manifest = *manifestResult.value();
+        if (manifest.expectedCount != total || static_cast<int>(findings.size()) != total ||
+            runResult.value().totalViolations != total) {
+            std::cerr << "Run manifest count does not match stored findings.\n";
+            return 1;
+        }
+
+        // Determine HMAC key to use for verification (never log the value).
         std::string hmacKey;
-        if (opts.verifyHmacKey.has_value()) {
-            std::string providedKey = opts.verifyHmacKey.value();
-            if (!providedKey.empty()) {
-                hmacKey = providedKey;
-            } else {
-                hmacKey = cfg.security.hmacKey;
-            }
-            std::cerr << "[DEBUG] verifyHmacKey provided: '" << providedKey << "', using: '" << hmacKey << "'\n";
+        if (opts.verifyHmacKey.has_value() && !opts.verifyHmacKey.value().empty()) {
+            hmacKey = opts.verifyHmacKey.value();
+            SPDLOG_DEBUG("Using caller-supplied HMAC key for verification");
         } else {
             hmacKey = cfg.security.hmacKey;
-            std::cerr << "[DEBUG] verifyHmacKey not provided, using config: '" << hmacKey << "'\n";
+            SPDLOG_DEBUG("Using configured HMAC key for verification (supplied: {})",
+                         opts.verifyHmacKey.has_value() ? "yes" : "no");
+        }
+        if (hmacKey.empty()) {
+            std::cerr << "A 256-bit HMAC key is required to verify a run.\n";
+            return 1;
         }
 
         // Verify each finding's hash
         bool allValid = true;
         Reconciler reconciler(nullptr, hmacKey, &cfg.policy);
-        
-        std::cerr << "[DEBUG] Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "\n";
+        std::vector<std::string> hashes;
+        hashes.reserve(findings.size());
+
+        SPDLOG_INFO("Verifying {} findings for run {}", findings.size(), opts.verifyRunId);
         std::cout << "Verifying " << findings.size() << " findings for run " << opts.verifyRunId << "...\n";
         
         try {
             for (size_t i = 0; i < findings.size(); ++i) {
                 const auto& f = findings[i];
+                hashes.push_back(f.integrityHash);
                 
-                std::string computedHash = Reconciler::verifyHash(f.userId, f.type, f.severity, hmacKey);
+                std::string computedHash = reconciler.findingSignature(
+                    opts.verifyRunId, f.userId, f.type, f.severity, f.detectedAt);
                 
-                if (computedHash == f.integrityHash) {
+                if (computedHash.size() == f.integrityHash.size() &&
+                    CRYPTO_memcmp(computedHash.data(), f.integrityHash.data(), computedHash.size()) == 0) {
                     std::cout << "  [" << (i + 1) << "/" << findings.size() << "] OK: " << f.userId
                               << " (" << std::string(toString(f.type)) << ", " << std::string(toString(f.severity)) << ")\n";
                 } else {
@@ -629,16 +667,20 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
                 }
             }
         } catch (const std::exception& e) {
-            std::cerr << "[EXCEPTION] " << e.what() << "\n";
+            SPDLOG_ERROR("Verification failed with exception: {}", e.what());
             return 1;
         } catch (...) {
-            std::cerr << "[EXCEPTION] Unknown exception\n";
+            SPDLOG_ERROR("Verification failed with unknown exception");
             return 1;
         }
-        
-        // Also verify hash chain continuity (each finding's hash should be unique for different inputs)
-        // This is implicitly checked by comparing each hash to its expected value
-        
+
+        const std::string computedManifest = reconciler.manifestSignature(opts.verifyRunId, hashes);
+        if (computedManifest.size() != manifest.signature.size() ||
+            CRYPTO_memcmp(computedManifest.data(), manifest.signature.data(), computedManifest.size()) != 0) {
+            std::cerr << "Run manifest signature mismatch.\n";
+            allValid = false;
+        }
+
         if (allValid) {
             std::cout << "\nAll " << findings.size() << " findings verified successfully.\n";
             SPDLOG_INFO("Verification successful: all {} findings in run {} are valid", findings.size(), opts.verifyRunId);
@@ -649,10 +691,10 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
             return 1;
         }
     } catch (const std::exception& e) {
-        std::cerr << "[EXCEPTION] " << e.what() << "\n";
+        SPDLOG_ERROR("Verify command failed: {}", e.what());
         return 1;
     } catch (...) {
-        std::cerr << "[EXCEPTION] Unknown exception\n";
+        SPDLOG_ERROR("Verify command failed with unknown exception");
         return 1;
     }
 }

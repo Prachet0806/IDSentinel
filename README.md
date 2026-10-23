@@ -8,17 +8,17 @@ IDSentinel is a C++23 identity reconciliation engine that compares an **authorit
 
 ## Features
 
-* **Hybrid Connectivity** — Network-first HR feed ingestion (HTTPS-only via libcurl) with automatic local CSV fallback
+* **Hybrid Connectivity** — Network-first HR feed ingestion (HTTPS-only via libcurl); local CSV fallback requires `--allow-local-fallback`
 * **Fail-Closed Validation** — Schema, emptiness, duplicate-ID, malformed-row (5%), and size-sanity checks gate every run
 * **TLS Verification** — Certificate validation always on; redirects restricted to HTTPS; configurable CA bundle
 * **Fetch Hardening** — Response size limit, retry with exponential backoff for transient failures, credential redaction in logs
-* **HMAC-SHA256 Integrity** — Tamper-evident finding hashes with optional HMAC key (zeroized after use)
+* **HMAC-SHA256 Integrity** — Durable runs require a 32-byte HMAC key and store a signed manifest that covers the run ID, finding count, and ordered finding hashes
 * **Audit-Grade Persistence** — Immutable `finding_evidence` + mutable `finding_status` with full transition history; stale runs marked ABANDONED
 * **High Performance** — Streaming CSV ingestion, bulk insert for 100k+ identities, indexes on query paths
 * **Policy-Driven** — Configurable severity levels (CRITICAL/HIGH/MEDIUM/LOW) for orphan, missing, and drift findings
 * **Failure-Aware** — Invalid sources trigger hard stop; transaction rollback on any error; single-writer process lock
 * **Structured Logging** — Escaped JSON or text output; file logging is opt-in, with rotation support (spdlog)
-* **Modern CLI** — Subcommands: `reconcile`, `inspect`, `config`, `keygen` (CLI11)
+* **Modern CLI** — Subcommands: `reconcile`, `inspect`, `verify`, `config`, `keygen` (CLI11)
 * **TOML Configuration** — Hierarchical config with environment variable overrides
 * **Cross-Platform** — Linux, macOS, Windows (vcpkg for dependencies)
 
@@ -94,7 +94,9 @@ Binary output: `build/bin/IDSentinel` (or `build/bin/Release/IDSentinel.exe` on 
 ### Quick Start
 
 ```bash
-# Run reconciliation (uses config.toml defaults)
+# Configure an actual HR HTTPS endpoint and a secret key before a durable run.
+export IDSENTINEL_NETWORK__HR_FEED_URL="https://your-hr.example.com/feed.csv"
+export IDSENTINEL_SECURITY__HMAC_KEY="$(./build/bin/IDSentinel keygen)"
 ./build/bin/IDSentinel reconcile
 
 # Dry-run: preview violations without writing to DB
@@ -102,6 +104,9 @@ Binary output: `build/bin/IDSentinel` (or `build/bin/Release/IDSentinel.exe` on 
 
 # Inspect a specific run (paginated; run-not-found exits 1)
 ./build/bin/IDSentinel inspect --run-id RUN_abc123 --format json --limit 50 --offset 0
+
+# Verify the signed run manifest and all finding hashes
+./build/bin/IDSentinel verify --run-id RUN_abc123
 
 # Show current configuration
 ./build/bin/IDSentinel config
@@ -137,16 +142,22 @@ drift_severity = "HIGH"
 
 [source]
 max_file_age_hours = 0  # 0 = freshness check disabled; >0 rejects stale local files
+hr_fallback_path = "data/hr_feed.csv"  # used only with --allow-local-fallback
+target_path = "data/system_dump.csv"  # relative to this config file
 
 [logging]
 level = "info"
 format = "json"
 file = ""  # empty = console only (file logging is opt-in)
-rotation = { max_size_mb = 10, max_files = 30, daily = true }
+rotation = { max_size_mb = 10, max_files = 30, daily = false }  # size-limited rotation
 
 [security]
-hmac_key = ""  # base64-encoded 32-byte key (generate with: idsentinel keygen)
+hmac_key = ""  # must be set for durable reconciliation; prefer an environment variable
 ```
+
+With `daily = false`, log files rotate at `max_size_mb` and retain `max_files`.
+With `daily = true`, files rotate at midnight and retain `max_files`;
+`max_size_mb` does not apply in that mode.
 
 ### Environment Variable Overrides
 
@@ -183,7 +194,19 @@ export IDSENTINEL_SECURITY__HMAC_KEY="$(idsentinel keygen)"
 | violation_type | ORPHAN_ACCOUNT / MISSING_ACCOUNT / ATTRIBUTE_DRIFT |
 | severity | CRITICAL / HIGH / MEDIUM / LOW |
 | detected_at | Timestamp |
-| integrity_hash | HMAC-SHA256 or SHA-256 hash |
+| integrity_hash | HMAC-SHA256 over run ID, user ID, type, severity, and detection time for CLI-created durable runs |
+
+### `run_manifests` — Signed completion evidence (schema v2)
+| Column | Description |
+|--------|-------------|
+| run_id | FK → recon_runs |
+| algorithm_version | Manifest format version (2) |
+| expected_count | Number of findings sealed at completion |
+| signature | HMAC over run ID, count, and ordered finding hashes |
+
+`verify` requires a successful run, a manifest, and the original HMAC key. Runs
+from older schemas without a manifest are reported as unverifiable. A writable
+open refuses the pre-split `compliance_findings` schema to preserve legacy data.
 
 ### `finding_status` — Mutable workflow state (one row per finding)
 | Column | Description |
@@ -254,7 +277,7 @@ $ idsentinel inspect --run-id RUN_0x2748a3f2_0x7f8b1c2d --format json
 * **CA Bundle**: Configure via `network.ca_bundle_path` or `IDSENTINEL_NETWORK__CA_BUNDLE_PATH`
 * **Fetch Limits**: `network.max_response_mb` caps response size; `network.max_retries` bounds transient-failure retries
 * **Log Hygiene**: URLs are redacted (no userinfo/query/fragment) before logging
-* **Integrity Hashes**: HMAC-SHA256 when `security.hmac_key` is set (32-byte base64 key, zeroized after use); falls back to SHA-256 with warning
+* **Integrity Hashes**: Durable CLI runs require a 32-byte base64 HMAC key. `verify` checks every finding and the signed run manifest, including zero-finding runs. Direct library callers without a key can still produce unsigned runs, which `verify` refuses.
 * **Key Generation**: `idsentinel keygen` outputs base64 key; or `openssl rand -base64 32`
 * **Single Writer**: An exclusive lock file (`<db>.lock`) refuses concurrent runs
 

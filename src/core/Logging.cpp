@@ -26,17 +26,10 @@ std::string formatTime(spdlog::log_clock::time_point tp) { // NOLINT(readability
     // Calculate UTC offset correctly, handling DST.
     long offsetSec = 0;
 #ifdef _WIN32
-    // On Windows, use _get_timezone and _get_dstbias
-    long timezone = 0;
-    _get_timezone(&timezone);
-    long dstbias = 0;
-    _get_dstbias(&dstbias);
-    offsetSec = -timezone - dstbias;
-    // Check if DST is in effect for this time
-    if (localTm.tm_isdst > 0) {
-        constexpr long kDstHourSec = 3600; // NOLINT(readability-magic-numbers): seconds per hour
-        offsetSec -= kDstHourSec; // DST adds an hour
-    }
+    // Interpret the broken-down local time as UTC; the epoch difference is
+    // the offset that was in effect for this timestamp, including DST.
+    std::tm localAsUtc = localTm;
+    offsetSec = static_cast<long>(std::difftime(_mkgmtime(&localAsUtc), t));
 #else
     // On POSIX, use tm_gmtoff if available (GNU extension)
 #if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
@@ -72,94 +65,14 @@ public:
         auto levelSv = spdlog::level::to_string_view(msg.level);
         j["level"] = std::string(levelSv.data(), levelSv.size());
         j["logger"] = std::string(msg.logger_name.begin(), msg.logger_name.end());
-        // Handle potential non-UTF-8 in message payload
-        std::string message;
-        try {
-            message = std::string(msg.payload.begin(), msg.payload.end());
-            // Validate UTF-8 by attempting to parse as JSON
-            (void)nlohmann::json::parse("\"" + message + "\"");
-        } catch (...) {
-            // Replace invalid UTF-8 sequences with replacement character
-            message = sanitizeUtf8(std::string(msg.payload.begin(), msg.payload.end()));
-        }
-        j["message"] = message;
-        std::string out = j.dump();
+        j["message"] = std::string(msg.payload.begin(), msg.payload.end());
+        std::string out = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
         dest.append(out.data(), out.data() + out.size());
         dest.push_back('\n');
     }
 
     std::unique_ptr<spdlog::formatter> clone() const override {
         return std::make_unique<JsonFormatter>();
-    }
-
-private:
-    static std::string sanitizeUtf8(std::string input) { // NOLINT(readability-function-cognitive-complexity): byte-class state machine is inherently branchy
-        std::string output;
-        output.reserve(input.size());
-        // UTF-8 lead-byte markers and UTF-8 replacement character (EF BF BD).
-        constexpr unsigned char kAsciiMax = 0x80; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kTwoByteMark = 0xC0; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kTwoByteMask = 0xE0; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kThreeByteMark = 0xE0; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kThreeByteMask = 0xF0; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kFourByteMark = 0xF0; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kFourByteMask = 0xF8; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kContMark = 0x80; // NOLINT(readability-magic-numbers)
-        constexpr unsigned char kContMask = 0xC0; // NOLINT(readability-magic-numbers)
-        for (size_t i = 0; i < input.size(); ++i) {
-            unsigned char c = static_cast<unsigned char>(input[i]);
-            if (c < kAsciiMax) {
-                // ASCII - copy as-is
-                output.push_back(input[i]);
-            } else if ((c & kTwoByteMask) == kTwoByteMark) {
-                // 2-byte sequence
-                if (i + 1 < input.size() && (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark) {
-                    output.push_back(input[i]);
-                    output.push_back(input[i + 1]);
-                    ++i;
-                } else {
-                    output.push_back('\xEF');
-                    output.push_back('\xBF');
-                    output.push_back('\xBD'); // Replacement character
-                }
-            } else if ((c & kThreeByteMask) == kThreeByteMark) {
-                // 3-byte sequence
-                if (i + 2 < input.size() &&
-                    (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark &&
-                    (static_cast<unsigned char>(input[i + 2]) & kContMask) == kContMark) {
-                    output.push_back(input[i]);
-                    output.push_back(input[i + 1]);
-                    output.push_back(input[i + 2]);
-                    i += 2;
-                } else {
-                    output.push_back('\xEF');
-                    output.push_back('\xBF');
-                    output.push_back('\xBD');
-                }
-            } else if ((c & kFourByteMask) == kFourByteMark) {
-                // 4-byte sequence
-                if (i + 3 < input.size() &&
-                    (static_cast<unsigned char>(input[i + 1]) & kContMask) == kContMark &&
-                    (static_cast<unsigned char>(input[i + 2]) & kContMask) == kContMark &&
-                    (static_cast<unsigned char>(input[i + 3]) & kContMask) == kContMark) {
-                    output.push_back(input[i]);
-                    output.push_back(input[i + 1]);
-                    output.push_back(input[i + 2]);
-                    output.push_back(input[i + 3]);
-                    i += 3;
-                } else {
-                    output.push_back('\xEF');
-                    output.push_back('\xBF');
-                    output.push_back('\xBD');
-                }
-            } else {
-                // Invalid leading byte
-                output.push_back('\xEF');
-                output.push_back('\xBF');
-                output.push_back('\xBD');
-            }
-        }
-        return output;
     }
 };
 
@@ -184,7 +97,7 @@ spdlog::sink_ptr createFileSink(LogFormat format, LogLevel level,
     std::shared_ptr<spdlog::sinks::sink> file_sink;
     if (dailyRotation) {
         file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
-            filePath.string(), 0, 0, true, maxFiles);
+            filePath.string(), 0, 0, false, static_cast<std::uint16_t>(maxFiles));
     } else {
         file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
             filePath.string(), maxFileSizeMb * 1024 * 1024, maxFiles, true); // NOLINT(readability-magic-numbers): MiB to bytes

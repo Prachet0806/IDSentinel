@@ -17,12 +17,14 @@ drift_severity = "HIGH"
 
 [source]
 max_file_age_hours = 0
+hr_fallback_path = "data/hr_feed.csv"
+target_path = "data/system_dump.csv"
 
 [logging]
 level = "info"
 format = "json"
 file = ""
-rotation = { max_size_mb = 10, max_files = 30, daily = true }
+rotation = { max_size_mb = 10, max_files = 30, daily = false }
 
 [security]
 hmac_key = ""
