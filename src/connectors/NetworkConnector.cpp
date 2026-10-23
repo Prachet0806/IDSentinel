@@ -13,7 +13,9 @@ std::string redactUrlForLogging(const std::string& url) {
     std::string out = url.substr(0, schemePos + 3);
     std::string rest = url.substr(schemePos + 3);
     // Drop query string and fragment.
-    rest = rest.substr(0, rest.find_first_of("?#"));
+    if (const auto suffixPos = rest.find_first_of("?#"); suffixPos != std::string::npos) {
+        rest.resize(suffixPos);
+    }
     // Drop userinfo credentials.
     auto atPos = rest.rfind('@');
     if (atPos != std::string::npos) {
