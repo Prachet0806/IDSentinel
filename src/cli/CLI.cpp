@@ -169,7 +169,7 @@ int runReconcile(const CLIOptions& opts) { // NOLINT(readability-function-cognit
     // Fetch HR feed
     NetworkConnector net;
     net.setTimeouts(cfg.network.timeoutSeconds, cfg.network.timeoutSeconds);
-    constexpr size_t kBytesPerMb = 1024 * 1024; // NOLINT(readability-magic-numbers): MiB to bytes
+    constexpr size_t kBytesPerMb = size_t{1024} * 1024; // NOLINT(readability-magic-numbers): MiB to bytes
     net.setMaxResponseBytes(static_cast<size_t>(cfg.network.maxResponseMb) * kBytesPerMb);
     net.setMaxRetries(cfg.network.maxRetries);
     if (!cfg.network.caBundlePath.empty()) {
@@ -611,11 +611,12 @@ int runVerify(const CLIOptions& opts) { // NOLINT(readability-function-cognitive
             std::cerr << "Cannot load run manifest: " << manifestResult.error().message << "\n";
             return 1;
         }
-        if (!manifestResult.value().has_value()) {
+        const auto& maybeManifest = manifestResult.value();
+        if (!maybeManifest.has_value()) {
             std::cerr << "Run has no signed manifest and cannot be verified.\n";
             return 1;
         }
-        const auto& manifest = *manifestResult.value();
+        const auto& manifest = *maybeManifest;
         if (manifest.expectedCount != total || static_cast<int>(findings.size()) != total ||
             runResult.value().totalViolations != total) {
             std::cerr << "Run manifest count does not match stored findings.\n";

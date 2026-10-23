@@ -4,6 +4,10 @@
 #include <sqlite3.h>
 #include <array>
 
+namespace {
+constexpr int kDetectedAtBindIndex = 6; // NOLINT(readability-magic-numbers): sixth INSERT parameter
+}
+
 ComplianceStore::ComplianceStore(const std::filesystem::path& dbPath, bool walMode, int busyTimeoutMs)
     : dbPath_(dbPath), walMode_(walMode), busyTimeoutMs_(busyTimeoutMs) {}
 
@@ -238,7 +242,7 @@ Result<void> ComplianceStore::logViolation(const ViolationRecord& record, const 
     if (auto r = bindText(stmt, 3, std::string(toString(record.type))); r.hasError()) { cleanup(); return r; }
     if (auto r = bindText(stmt, 4, std::string(toString(record.severity))); r.hasError()) { cleanup(); return r; }
     if (auto r = bindText(stmt, 5, integrityHash); r.hasError()) { cleanup(); return r; }
-    if (auto r = bindText(stmt, 6, record.detectedAt); r.hasError()) { cleanup(); return r; }
+    if (auto r = bindText(stmt, kDetectedAtBindIndex, record.detectedAt); r.hasError()) { cleanup(); return r; }
 
     int rc = sqlite3_step(stmt);
     cleanup();
@@ -269,7 +273,7 @@ Result<void> ComplianceStore::bulkInsertViolation(const ViolationRecord& record,
     if (auto r = bindText(bulkStmt_, 3, std::string(toString(record.type))); r.hasError()) return r;
     if (auto r = bindText(bulkStmt_, 4, std::string(toString(record.severity))); r.hasError()) return r;
     if (auto r = bindText(bulkStmt_, 5, integrityHash); r.hasError()) return r;
-    if (auto r = bindText(bulkStmt_, 6, record.detectedAt); r.hasError()) return r;
+    if (auto r = bindText(bulkStmt_, kDetectedAtBindIndex, record.detectedAt); r.hasError()) return r;
 
     int rc = sqlite3_step(bulkStmt_);
     if (rc != SQLITE_DONE) {

@@ -8,6 +8,8 @@
 #include <spdlog/spdlog.h>
 
 namespace {
+constexpr size_t kMaxRecordBytes = size_t{1024} * 1024; // NOLINT(readability-magic-numbers): one MiB CSV record limit
+
 std::string trimAndLower(std::string s) { // NOLINT(performance-unnecessary-value-param): input is normalized in place
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
         s.pop_back();
@@ -158,7 +160,6 @@ Result<CSVParseResult> CSVParser::parseFromStream(std::istream& input) { // NOLI
 
         if (line.empty()) continue;
 
-        constexpr size_t kMaxRecordBytes = 1024 * 1024; // NOLINT(readability-magic-numbers): one MiB CSV record limit
         while (!balancedQuotes(line)) {
             std::string continuation;
             if (!std::getline(input, continuation)) {
@@ -252,7 +253,6 @@ Result<void> CSVParser::parseStream(std::istream& input, const RowCallback& call
         ++lineNum;
         if (line.empty()) continue;
 
-        constexpr size_t kMaxRecordBytes = 1024 * 1024; // NOLINT(readability-magic-numbers): one MiB CSV record limit
         while (!balancedQuotes(line)) {
             std::string continuation;
             if (!std::getline(input, continuation)) {
